@@ -14,8 +14,8 @@
 ' A name change updates the existing feature. A specification change does not, and the rule explains why before cutting.
 ' Each identity field is its own attribute (Inventor string attributes hold 255 characters). The set is copied with the feature.
 ' After the holes succeed, the rule can place washers from the hardware library.
-' A washer sits on the component hole rim you clicked, or on the other end of that same hole.
-' The file prompt opens Hardware\<size>\Washers (for example Hardware\#8\Washers). Nuts and screws are not placed yet.
+' The nut side chooses the end: a washer under the nut sits there, and a washer under the screw sits on the other end.
+' The file prompt opens Hardware\<size>\Washers (for example Hardware\#8\Washers). Screws and nuts are not placed yet.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -190,7 +190,6 @@ Sub Main()
     Dim reviewProgress As Inventor.ProgressBar = Nothing
     Dim reviewOperation As String = "Preparing review"
     Dim desiredGroups As New System.Collections.Generic.SortedDictionary(Of String, OutputGroup)(System.StringComparer.Ordinal)
-    Dim preview As New System.Text.StringBuilder()
     Try
         Dim reviewSteps As Integer = 4 + buckets.Count + selected.Count
         reviewProgress = app.CreateProgressBar(False, reviewSteps, "Grouped Mounting Holes - Reviewing / Validating")
@@ -264,7 +263,7 @@ Sub Main()
 
         reviewOperation = "Comparing specifications with existing grouped holes"
         MGHProgressMessage(reviewProgress, app, reviewOperation)
-        Dim nameNotes As System.Collections.Generic.List(Of String) = MGHDescribeExistingGroups(plateDef, desiredGroups)
+        MGHDescribeExistingGroups(plateDef, desiredGroups)
 
         ' Test full seat envelope (NOT only pilot/core hole diameter).
         reviewOperation = "Checking selected face boundaries and hole/seat interference"
@@ -313,43 +312,9 @@ Sub Main()
                 MGHProgressTick(reviewProgress, app, "Checked " & allLocations.Count.ToString() & "/" & selected.Count.ToString() & " hole/seat envelopes")
             Next
         Next
-        reviewOperation = "Building final preview for " & desiredGroups.Count.ToString() & " groups"
+        reviewOperation = "Finishing validation for " & desiredGroups.Count.ToString() & " groups"
         MGHProgressTick(reviewProgress, app, reviewOperation)
-        preview.AppendLine("Part: " & plateDoc.DisplayName)
-        preview.AppendLine("Input selections: " & selected.Count.ToString())
-        preview.AppendLine("Unique output groups: " & desiredGroups.Count.ToString())
-        preview.AppendLine()
-        For Each g As OutputGroup In desiredGroups.Values
-            Dim detail As String = If(g.Mode = "Threaded", g.ThreadDesignation & " / " & g.ThreadClass, _
-                "Ø" & g.DiameterIn.ToString("0.0000") & " in")
-            Dim seatDetail As String = If(g.Seat = "None", "", " + " & g.Seat & " Ø" & _
-                g.SeatDiameterIn.ToString("0.0000") & " in")
-            preview.AppendLine(g.Label & "  [" & g.Mode & "] " & detail & seatDetail & _
-                "  (" & g.Centers.Count.ToString() & " positions)")
-        Next
-        preview.AppendLine()
-        preview.AppendLine("All pilot holes are THROUGH ALL. Threaded holes use FULL-length model threads.")
-        preview.AppendLine("Native standard clearance and thread dimensions come from Inventor's local tables.")
-        preview.AppendLine("This modifies the REAL plate .ipt and every assembly occurrence of it.")
-        preview.AppendLine("The script does NOT save the part automatically. Make a backup first.")
-        preview.AppendLine("After the holes succeed, you can place a washer on each hole. Skip that step to leave the assembly unchanged.")
-        If excluded.Count > 0 Then
-            preview.AppendLine()
-            preview.AppendLine(excluded.Count.ToString() & " selections were skipped:")
-            For Each msg As String In excluded
-                preview.AppendLine("- " & msg)
-            Next
-        End If
-        If nameNotes.Count > 0 Then
-            preview.AppendLine()
-            preview.AppendLine("Existing features with this specification:")
-            For Each note As String In nameNotes
-                preview.AppendLine("- " & note)
-            Next
-        End If
-        preview.AppendLine()
-        preview.Append("Verify the specifications, then choose GENERATE HOLES to proceed.")
-        MGHProgressTick(reviewProgress, app, "Validation finished — ready for final confirmation")
+        MGHProgressTick(reviewProgress, app, "Validation finished")
     Catch ex As System.Exception
         System.Windows.Forms.MessageBox.Show("Review validation failed: " & reviewOperation & vbCrLf & ex.Message, "Grouped Mounting Holes")
         Exit Sub
@@ -361,11 +326,6 @@ Sub Main()
             End Try
         End If
     End Try
-
-    Dim approval As New MGHGenerateDialog(preview.ToString())
-    Dim approvalResult As System.Windows.Forms.DialogResult = approval.ShowDialog()
-    approval.Dispose()
-    If approvalResult <> System.Windows.Forms.DialogResult.OK Then Exit Sub
 
     Dim trans As Inventor.Transaction = Nothing
     Dim progress As Inventor.ProgressBar = Nothing
@@ -643,6 +603,8 @@ Sub Main()
             "Groups whose cut direction was reversed: " & flippedGroups.ToString() & vbCrLf & _
             "New hole centers: " & newPoints.ToString() & vbCrLf & _
             "Duplicate centers skipped: " & skippedDuplicates.ToString() & vbCrLf & _
+            If(excluded.Count = 0, "", vbCrLf & "Selections skipped:" & vbCrLf & _
+                String.Join(vbCrLf, excluded.ToArray()) & vbCrLf) & _
             If(namingWarnings.Count = 0, "", vbCrLf & "Naming notes (geometry was created):" & vbCrLf & _
                 String.Join(vbCrLf, namingWarnings.ToArray()) & vbCrLf) & vbCrLf & _
             washerSummary & vbCrLf & vbCrLf & _
@@ -934,116 +896,105 @@ Public Class MGHSelectionPalette
     End Sub
 End Class
 
-Public Class MGHGenerateDialog
-    Inherits System.Windows.Forms.Form
-
-    Public Sub New(message As String)
-        MyBase.New()
-        Me.Text = "Verify Mounting Holes Before Generating"
-        Me.Width = 660 : Me.Height = 530
-        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
-        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable
-        Me.MinimizeBox = False
-
-        Dim reviewText As New System.Windows.Forms.TextBox()
-        reviewText.Left = 12 : reviewText.Top = 12
-        reviewText.Width = 620 : reviewText.Height = 410
-        reviewText.Multiline = True
-        reviewText.ScrollBars = System.Windows.Forms.ScrollBars.Vertical
-        reviewText.ReadOnly = True
-        reviewText.Text = message
-        reviewText.Anchor = System.Windows.Forms.AnchorStyles.Top Or _
-            System.Windows.Forms.AnchorStyles.Bottom Or _
-            System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
-        Me.Controls.Add(reviewText)
-
-        Dim goBtn As New System.Windows.Forms.Button()
-        goBtn.Text = "Generate Holes"
-        goBtn.Width = 155 : goBtn.Top = 437 : goBtn.Left = 478
-        goBtn.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
-        AddHandler goBtn.Click, AddressOf GenerateClick
-        Me.Controls.Add(goBtn)
-
-        Dim cancelBtn As New System.Windows.Forms.Button()
-        cancelBtn.Text = "Cancel Without Changes"
-        cancelBtn.Width = 170 : cancelBtn.Top = 437 : cancelBtn.Left = 297
-        cancelBtn.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
-        AddHandler cancelBtn.Click, AddressOf CancelClick
-        Me.Controls.Add(cancelBtn)
-    End Sub
-
-    Private Sub GenerateClick(sender As Object, e As System.EventArgs)
-        Me.DialogResult = System.Windows.Forms.DialogResult.OK
-        Me.Close()
-    End Sub
-    Private Sub CancelClick(sender As Object, e As System.EventArgs)
-        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
-        Me.Close()
-    End Sub
-End Class
-
-' One choice for the whole run: which end of the selected component hole gets the washer.
-' The library path is remembered on the assembly after an end is chosen.
+' Nut side orients the washers. Screw and nut placement are shown but not available yet.
 Public Class MGHWasherSideDialog
     Inherits System.Windows.Forms.Form
     Private libraryBox As System.Windows.Forms.TextBox
-    Public OnSelectedRim As Boolean
+    Private nutOnRim As System.Windows.Forms.RadioButton
+    Private washerUnderScrewBox As System.Windows.Forms.CheckBox
+    Private washerUnderNutBox As System.Windows.Forms.CheckBox
+    Public NutOnSelectedRim As Boolean
+    Public WasherUnderScrew As Boolean
+    Public WasherUnderNut As Boolean
     Public LibraryPath As String
 
     Public Sub New(initialLibrary As String)
         MyBase.New()
-        Me.Text = "Place washers?"
-        Me.Width = 640 : Me.Height = 300
+        Me.Text = "Place hardware?"
+        Me.Width = 560 : Me.Height = 500
         Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
         Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
         Me.MaximizeBox = False : Me.MinimizeBox = False
         Dim note As New System.Windows.Forms.Label()
-        note.Left = 14 : note.Top = 12 : note.Width = 600 : note.Height = 72
-        note.Text = "Washers are placed on the component holes whose rims you clicked, one part per fastener size." & vbCrLf & _
-            "The next window opens that size's Washers folder so you can pick the .ipt." & vbCrLf & _
-            "Selected rim is the edge you clicked. Opposite end is the other side of that same hole."
+        note.Left = 14 : note.Top = 12 : note.Width = 516 : note.Height = 58
+        note.Text = "Checked washers are placed on the component holes you selected." & vbCrLf & _
+            "The nut side sets which end each washer uses. Screws and nuts are not placed yet." & vbCrLf & _
+            "The next window opens that size's Washers folder so you can pick the .ipt."
         Me.Controls.Add(note)
         Dim libraryLabel As New System.Windows.Forms.Label()
-        libraryLabel.Left = 14 : libraryLabel.Top = 92 : libraryLabel.Width = 90 : libraryLabel.Height = 22
+        libraryLabel.Left = 14 : libraryLabel.Top = 80 : libraryLabel.Width = 80 : libraryLabel.Height = 22
         libraryLabel.Text = "Library"
         Me.Controls.Add(libraryLabel)
         libraryBox = New System.Windows.Forms.TextBox()
-        libraryBox.Left = 104 : libraryBox.Top = 90 : libraryBox.Width = 500 : libraryBox.Height = 22
+        libraryBox.Left = 100 : libraryBox.Top = 78 : libraryBox.Width = 424 : libraryBox.Height = 22
         libraryBox.ReadOnly = True
         libraryBox.Text = initialLibrary
         Me.Controls.Add(libraryBox)
-
-        Dim oppositeBtn As New System.Windows.Forms.Button()
-        oppositeBtn.Text = "Opposite End of Hole"
-        oppositeBtn.Left = 14 : oppositeBtn.Top = 132 : oppositeBtn.Width = 290 : oppositeBtn.Height = 40
-        AddHandler oppositeBtn.Click, AddressOf ChooseOpposite
-        Me.Controls.Add(oppositeBtn)
-        Dim selectedBtn As New System.Windows.Forms.Button()
-        selectedBtn.Text = "Selected Hole Rim"
-        selectedBtn.Left = 316 : selectedBtn.Top = 132 : selectedBtn.Width = 288 : selectedBtn.Height = 40
-        AddHandler selectedBtn.Click, AddressOf ChooseSelected
-        Me.Controls.Add(selectedBtn)
         Dim changeBtn As New System.Windows.Forms.Button()
         changeBtn.Text = "Change Hardware Folder"
-        changeBtn.Left = 14 : changeBtn.Top = 188 : changeBtn.Width = 200 : changeBtn.Height = 32
+        changeBtn.Left = 14 : changeBtn.Top = 108 : changeBtn.Width = 200 : changeBtn.Height = 28
         AddHandler changeBtn.Click, AddressOf ChangeLibrary
         Me.Controls.Add(changeBtn)
+
+        Dim nutGroup As New System.Windows.Forms.GroupBox()
+        nutGroup.Text = "Nut is on"
+        nutGroup.Left = 14 : nutGroup.Top = 148 : nutGroup.Width = 516 : nutGroup.Height = 72
+        nutOnRim = New System.Windows.Forms.RadioButton()
+        nutOnRim.Text = "Hole rim I clicked"
+        nutOnRim.Left = 16 : nutOnRim.Top = 28 : nutOnRim.Width = 220 : nutOnRim.Height = 24
+        nutGroup.Controls.Add(nutOnRim)
+        Dim nutOpposite As New System.Windows.Forms.RadioButton()
+        nutOpposite.Text = "Opposite end of the hole"
+        nutOpposite.Left = 250 : nutOpposite.Top = 28 : nutOpposite.Width = 240 : nutOpposite.Height = 24
+        nutOpposite.Checked = True
+        nutGroup.Controls.Add(nutOpposite)
+        Me.Controls.Add(nutGroup)
+
+        Dim placeGroup As New System.Windows.Forms.GroupBox()
+        placeGroup.Text = "Place"
+        placeGroup.Left = 14 : placeGroup.Top = 230 : placeGroup.Width = 516 : placeGroup.Height = 148
+        Dim screwBox As New System.Windows.Forms.CheckBox()
+        screwBox.Text = "Screw"
+        screwBox.Enabled = False
+        screwBox.Left = 16 : screwBox.Top = 28 : screwBox.Width = 470 : screwBox.Height = 24
+        placeGroup.Controls.Add(screwBox)
+        washerUnderScrewBox = New System.Windows.Forms.CheckBox()
+        washerUnderScrewBox.Text = "Washer under screw"
+        washerUnderScrewBox.Left = 16 : washerUnderScrewBox.Top = 54 : washerUnderScrewBox.Width = 470 : washerUnderScrewBox.Height = 24
+        placeGroup.Controls.Add(washerUnderScrewBox)
+        washerUnderNutBox = New System.Windows.Forms.CheckBox()
+        washerUnderNutBox.Text = "Washer under nut"
+        washerUnderNutBox.Checked = True
+        washerUnderNutBox.Left = 16 : washerUnderNutBox.Top = 80 : washerUnderNutBox.Width = 470 : washerUnderNutBox.Height = 24
+        placeGroup.Controls.Add(washerUnderNutBox)
+        Dim nutBox As New System.Windows.Forms.CheckBox()
+        nutBox.Text = "Nut"
+        nutBox.Enabled = False
+        nutBox.Left = 16 : nutBox.Top = 106 : nutBox.Width = 470 : nutBox.Height = 24
+        placeGroup.Controls.Add(nutBox)
+        Me.Controls.Add(placeGroup)
+
+        Dim placeBtn As New System.Windows.Forms.Button()
+        placeBtn.Text = "Place Hardware"
+        placeBtn.Left = 14 : placeBtn.Top = 394 : placeBtn.Width = 160 : placeBtn.Height = 32
+        AddHandler placeBtn.Click, AddressOf PlaceHardware
+        Me.Controls.Add(placeBtn)
         Dim skipBtn As New System.Windows.Forms.Button()
-        skipBtn.Text = "Skip Washers"
-        skipBtn.Left = 474 : skipBtn.Top = 188 : skipBtn.Width = 130 : skipBtn.Height = 32
+        skipBtn.Text = "Skip Hardware"
+        skipBtn.Left = 370 : skipBtn.Top = 394 : skipBtn.Width = 160 : skipBtn.Height = 32
         AddHandler skipBtn.Click, AddressOf SkipWashers
         Me.Controls.Add(skipBtn)
     End Sub
 
-    Private Sub ChooseOpposite(sender As Object, e As System.EventArgs)
+    Private Sub PlaceHardware(sender As Object, e As System.EventArgs)
+        If Not washerUnderScrewBox.Checked AndAlso Not washerUnderNutBox.Checked Then
+            System.Windows.Forms.MessageBox.Show("Check a washer to place, or click Skip Hardware.", "Place hardware?")
+            Exit Sub
+        End If
         LibraryPath = libraryBox.Text.Trim()
-        OnSelectedRim = False
-        Me.DialogResult = System.Windows.Forms.DialogResult.OK
-        Me.Close()
-    End Sub
-    Private Sub ChooseSelected(sender As Object, e As System.EventArgs)
-        LibraryPath = libraryBox.Text.Trim()
-        OnSelectedRim = True
+        NutOnSelectedRim = nutOnRim.Checked
+        WasherUnderScrew = washerUnderScrewBox.Checked
+        WasherUnderNut = washerUnderNutBox.Checked
         Me.DialogResult = System.Windows.Forms.DialogResult.OK
         Me.Close()
     End Sub
@@ -2006,8 +1957,27 @@ Function MGHFormatPoint(point As Inventor.Point) As String
     Return point.X.ToString("0.000000", culture) & "," & point.Y.ToString("0.000000", culture) & "," & point.Z.ToString("0.000000", culture)
 End Function
 
-' A placed washer is named "MGH Washer #4 [x,y,z]" so a later run can replace it
-' even when the assembly refuses to store attributes.
+' Nut side is the end the user chose. The washer under the screw uses the other end.
+Function MGHWasherUsesSelectedRim(underNut As Boolean, nutOnSelectedRim As Boolean) As Boolean
+    If underNut Then Return nutOnSelectedRim
+    Return Not nutOnSelectedRim
+End Function
+
+' A name from an older run has no end word and matches either end.
+' A current name says "selected" or "opposite" and matches only that end.
+Function MGHWasherNameMatchesEnd(name As String, endName As String) As Boolean
+    If name Is Nothing OrElse name = "" Then Return False
+    Dim lower As String = name.ToLowerInvariant()
+    Dim hasSelected As Boolean = lower.Contains("selected")
+    Dim hasOpposite As Boolean = lower.Contains("opposite")
+    If Not hasSelected AndAlso Not hasOpposite Then Return True
+    If String.Equals(endName, "Selected", System.StringComparison.OrdinalIgnoreCase) Then Return hasSelected AndAlso Not hasOpposite
+    If String.Equals(endName, "Opposite", System.StringComparison.OrdinalIgnoreCase) Then Return hasOpposite AndAlso Not hasSelected
+    Return False
+End Function
+
+' A placed washer is named "MGH Washer #4 opposite [x,y,z]" so a later run can replace
+' that end even when the assembly refuses to store attributes.
 Function MGHCenterTextFromWasherName(name As String) As String
     If name Is Nothing OrElse name = "" Then Return ""
     If Not name.StartsWith("MGH Washer ", System.StringComparison.OrdinalIgnoreCase) Then Return ""
@@ -2034,13 +2004,22 @@ Function MGHUniqueOccurrenceName(occs As Inventor.ComponentOccurrences, requeste
 End Function
 
 Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    centers As System.Collections.Generic.List(Of Inventor.Point), keep As Inventor.ComponentOccurrence) As Integer
+    centers As System.Collections.Generic.List(Of Inventor.Point), keep As Inventor.ComponentOccurrence, _
+    endName As String) As Integer
     Dim doomed As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)()
     For Each occ As Inventor.ComponentOccurrence In asm.ComponentDefinition.Occurrences
         Try
             If keep IsNot Nothing AndAlso occ Is keep Then Continue For
             Dim stored As Inventor.Point = Nothing
             Dim sawOtherRole As Boolean = False
+            Dim haveSide As Boolean = False
+            Dim sideOk As Boolean = True
+            Dim occName As String = ""
+            Try
+                occName = occ.Name
+            Catch
+                occName = ""
+            End Try
             Try
                 If occ.AttributeSets.NameIsUsed("MGH_Hardware") Then
                     Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
@@ -2048,18 +2027,19 @@ Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.Assembl
                         sawOtherRole = True
                     Else
                         stored = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
+                        Dim side As String = MGHGetAttr(aset, "Side")
+                        If side <> "" Then
+                            haveSide = True
+                            sideOk = String.Equals(side, endName, System.StringComparison.OrdinalIgnoreCase)
+                        End If
                     End If
                 End If
             Catch
             End Try
             If sawOtherRole Then Continue For
+            If haveSide AndAlso Not sideOk Then Continue For
             If stored Is Nothing Then
-                Dim occName As String = ""
-                Try
-                    occName = occ.Name
-                Catch
-                    occName = ""
-                End Try
+                If Not MGHWasherNameMatchesEnd(occName, endName) Then Continue For
                 stored = MGHParseStoredPoint(app, MGHCenterTextFromWasherName(occName))
             End If
             If stored Is Nothing Then Continue For
@@ -2316,10 +2296,12 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     If library = "" OrElse Not System.IO.Directory.Exists(library) Then library = MGHDefaultHardwareLibrary()
     Dim sideDialog As New MGHWasherSideDialog(library)
     Dim sideResult As System.Windows.Forms.DialogResult = sideDialog.ShowDialog()
-    Dim onSelectedRim As Boolean = sideDialog.OnSelectedRim
+    Dim nutOnSelectedRim As Boolean = sideDialog.NutOnSelectedRim
+    Dim placeUnderScrew As Boolean = sideDialog.WasherUnderScrew
+    Dim placeUnderNut As Boolean = sideDialog.WasherUnderNut
     library = sideDialog.LibraryPath
     sideDialog.Dispose()
-    If sideResult <> System.Windows.Forms.DialogResult.OK Then Return "Washers: skipped."
+    If sideResult <> System.Windows.Forms.DialogResult.OK Then Return "Hardware: skipped."
     If library = "" OrElse Not System.IO.Directory.Exists(library) Then
         Dim browsed As String = MGHBrowseHardwareLibrary(library)
         If browsed = "" OrElse Not System.IO.Directory.Exists(browsed) Then Return "Washers: skipped. The hardware folder was not found."
@@ -2390,81 +2372,91 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             Dim centerIndex As Integer
             For centerIndex = 0 To g.Centers.Count - 1
                 Dim center As Inventor.Point = g.Centers(centerIndex)
-                Dim washerOcc As Inventor.ComponentOccurrence = Nothing
-                Dim kept As Boolean = False
-                Dim action As String = "finding the component hole"
-                Try
-                    app.StatusBarText = "Placing " & sizeName & " washer"
-                    Dim rim As MGHComponentRim = Nothing
-                    If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
-                    If rim Is Nothing Then
-                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
-                        Continue For
-                    End If
-                    action = "preparing the washer position"
-                    Dim contact As Inventor.Point = Nothing
-                    Dim outwardAsm As Inventor.UnitVector = Nothing
-                    Dim holeEdge As Inventor.Edge = Nothing
-                    If Not MGHComponentWasherSeat(app, rim, onSelectedRim, contact, outwardAsm, holeEdge) Then
-                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the other end of that component hole was not found.")
-                        Continue For
-                    End If
-                    action = "building the washer position"
-                    Dim matrix As Inventor.Matrix = MGHWasherMatrix(app, model, contact, outwardAsm)
-                    action = "adding the washer to the assembly"
-                    washerOcc = MGHAddWasherOccurrence(asm, model, matrix)
-                    kept = True
-                    placed += 1
-                    Dim centerText As String = MGHFormatPoint(center)
+                Dim rim As MGHComponentRim = Nothing
+                If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
+                If rim Is Nothing Then
+                    notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
+                    Continue For
+                End If
+                Dim roleIndex As Integer
+                For roleIndex = 0 To 1
+                    Dim underNut As Boolean = (roleIndex = 1)
+                    If underNut AndAlso Not placeUnderNut Then Continue For
+                    If Not underNut AndAlso Not placeUnderScrew Then Continue For
+                    Dim onSelectedRim As Boolean = MGHWasherUsesSelectedRim(underNut, nutOnSelectedRim)
+                    Dim endName As String = If(onSelectedRim, "Selected", "Opposite")
+                    Dim roleLabel As String = If(underNut, "washer under nut", "washer under screw")
+                    Dim washerOcc As Inventor.ComponentOccurrence = Nothing
+                    Dim kept As Boolean = False
+                    Dim action As String = "finding the component hole"
                     Try
-                        washerOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Washer " & sizeName & " [" & centerText & "]")
-                    Catch
-                    End Try
-                    Dim warning As String = ""
-                    Try
-                        If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
-                            warning = MGHConstrainWasher(app, asm, rim.Component, washerOcc, holeEdge, model, contact, outwardAsm)
-                        Else
+                        app.StatusBarText = "Placing " & sizeName & " " & roleLabel
+                        action = "preparing the washer position"
+                        Dim contact As Inventor.Point = Nothing
+                        Dim outwardAsm As Inventor.UnitVector = Nothing
+                        Dim holeEdge As Inventor.Edge = Nothing
+                        If Not MGHComponentWasherSeat(app, rim, onSelectedRim, contact, outwardAsm, holeEdge) Then
+                            notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " was skipped because the other end of that component hole was not found.")
+                            Continue For
+                        End If
+                        action = "building the washer position"
+                        Dim matrix As Inventor.Matrix = MGHWasherMatrix(app, model, contact, outwardAsm)
+                        action = "adding the washer to the assembly"
+                        washerOcc = MGHAddWasherOccurrence(asm, model, matrix)
+                        kept = True
+                        placed += 1
+                        Dim centerText As String = MGHFormatPoint(center)
+                        Try
+                            washerOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Washer " & sizeName & " " & endName.ToLowerInvariant() & " [" & centerText & "]")
+                        Catch
+                        End Try
+                        Dim warning As String = ""
+                        Try
+                            If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
+                                warning = MGHConstrainWasher(app, asm, rim.Component, washerOcc, holeEdge, model, contact, outwardAsm)
+                            Else
+                                Try
+                                    washerOcc.Grounded = True
+                                Catch
+                                End Try
+                                warning = "positioned and grounded because a circular rim was not found"
+                            End If
+                        Catch constrainEx As System.Exception
+                            notes.Add(sizeName & " " & roleLabel & " at " & centerText & " is placed, but constraining it failed: " & constrainEx.Message)
                             Try
                                 washerOcc.Grounded = True
                             Catch
                             End Try
-                            warning = "positioned and grounded because a circular rim was not found"
+                        End Try
+                        Try
+                            Dim aset As Inventor.AttributeSet = MGHEnsureAttributeSet(washerOcc.AttributeSets, "MGH_Hardware")
+                            MGHPutAttr(aset, "Role", "Washer")
+                            MGHPutAttr(aset, "Size", sizeName)
+                            MGHPutAttr(aset, "Center", centerText)
+                            MGHPutAttr(aset, "Side", endName)
+                            MGHPutAttr(aset, "Station", If(underNut, "UnderNut", "UnderScrew"))
+                            MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
+                        Catch
+                            notes.Add(sizeName & " " & roleLabel & " at " & centerText & " is placed, but its identity could not be stored on the assembly.")
+                        End Try
+                        Dim oneCenter As New System.Collections.Generic.List(Of Inventor.Point)()
+                        oneCenter.Add(center)
+                        Try
+                            replaced += MGHRemoveWashersAt(app, asm, oneCenter, washerOcc, endName)
+                        Catch
+                            notes.Add("The previous washer at " & centerText & " could not be removed.")
+                        End Try
+                        If warning <> "" Then notes.Add(sizeName & " " & roleLabel & " " & washerOcc.Name & " was " & warning & ".")
+                    Catch ex As System.Exception
+                        If washerOcc IsNot Nothing AndAlso Not kept Then
+                            Try
+                                washerOcc.Delete()
+                            Catch
+                            End Try
                         End If
-                    Catch constrainEx As System.Exception
-                        notes.Add(sizeName & " washer at " & centerText & " is placed, but constraining it failed: " & constrainEx.Message)
-                        Try
-                            washerOcc.Grounded = True
-                        Catch
-                        End Try
+                        notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " failed while " & action & ": " & ex.Message)
                     End Try
-                    Try
-                        Dim aset As Inventor.AttributeSet = MGHEnsureAttributeSet(washerOcc.AttributeSets, "MGH_Hardware")
-                        MGHPutAttr(aset, "Role", "Washer")
-                        MGHPutAttr(aset, "Size", sizeName)
-                        MGHPutAttr(aset, "Center", centerText)
-                        MGHPutAttr(aset, "Side", If(onSelectedRim, "Selected", "Opposite"))
-                        MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
-                    Catch
-                        notes.Add(sizeName & " washer at " & centerText & " is placed, but its identity could not be stored on the assembly.")
-                    End Try
-                    Dim oneCenter As New System.Collections.Generic.List(Of Inventor.Point)()
-                    oneCenter.Add(center)
-                    Try
-                        replaced += MGHRemoveWashersAt(app, asm, oneCenter, washerOcc)
-                    Catch
-                        notes.Add("The previous washer at " & centerText & " could not be removed.")
-                    End Try
-                    If warning <> "" Then notes.Add(sizeName & " washer " & washerOcc.Name & " was " & warning & ".")
-                Catch ex As System.Exception
-                    If washerOcc IsNot Nothing AndAlso Not kept Then
-                        Try
-                            washerOcc.Delete()
-                        Catch
-                        End Try
-                    End If
-                    notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " failed while " & action & ": " & ex.Message)
-                End Try
+                Next
             Next
         Next
     app.StatusBarText = ""
