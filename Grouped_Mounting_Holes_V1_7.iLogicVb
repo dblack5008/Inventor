@@ -18,8 +18,8 @@
 ' A washer under the nut sits on that side. A washer under the screw sits on the other side.
 ' A nut sits on the nut side, outside the washer under the nut when that washer is placed.
 ' The first time a nut or screw is used, click the face that sits against the washer. That face is saved on the part.
-' Before the screw file window, the rule shows the length under the head: rim-to-plate span, washers, and nut.
-' The file window then opens Hardware\<size>\Screws\<length>Lg.
+' Before each screw file window, the rule shows the length under the head: rim-to-plate span, washers, and nut.
+' Holes that need a different length get their own screw. The file window opens Hardware\<size>\Screws\<length>Lg.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -1035,6 +1035,24 @@ Public Class MGHWasherSideDialog
 End Class
 
 ' The component hole the user clicked. CenterX/Y/Z are assembly coordinates of that rim.
+' One chosen screw for every hole of a size that needs this length.
+Public Class MGHScrewRequest
+    Public Key As String
+    Public SizeName As String
+    Public RequiredInches As Double
+    Public GripIn As Double
+    Public ScrewWasherIn As Double
+    Public NutWasherIn As Double
+    Public NutIn As Double
+    Public HoleCount As Integer
+    Public GroupLabels As New System.Collections.Generic.List(Of String)()
+
+    Public Function LabelText() As String
+        If GroupLabels Is Nothing OrElse GroupLabels.Count = 0 Then Return ""
+        Return String.Join(", ", GroupLabels.ToArray())
+    End Function
+End Class
+
 Public Class MGHComponentRim
     Public Component As Inventor.ComponentOccurrence
     Public SelectedEdge As Inventor.Edge
@@ -1517,16 +1535,52 @@ Function MGHFormatInches(inches As Double) As String
     Return inches.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)
 End Function
 
+' Holes of one size that need the same thousandth of an inch share one screw file.
+Function MGHScrewLengthKey(sizeName As String, requiredInches As Double) As String
+    If sizeName Is Nothing Then sizeName = ""
+    If requiredInches < 0 Then requiredInches = 0
+    Return sizeName.Trim() & "|" & MGHFormatInches(requiredInches)
+End Function
+
+' Washer and nut thicknesses are centimeters. The returned allowances are inches.
+Sub MGHScrewAllowances(washerCm As Double, nutCm As Double, underScrew As Boolean, underNut As Boolean, includeNut As Boolean, _
+    ByRef screwWasherIn As Double, ByRef nutWasherIn As Double, ByRef nutIn As Double)
+    screwWasherIn = 0
+    nutWasherIn = 0
+    nutIn = 0
+    If washerCm > 0 AndAlso underScrew Then screwWasherIn = washerCm / 2.54
+    If washerCm > 0 AndAlso underNut Then nutWasherIn = washerCm / 2.54
+    If nutCm > 0 AndAlso includeNut Then nutIn = nutCm / 2.54
+End Sub
+
+' Grip is centimeters. Allowances are inches. The result is inches under the head.
+Function MGHScrewRequiredInches(gripCm As Double, screwWasherIn As Double, nutWasherIn As Double, nutIn As Double) As Double
+    Dim gripIn As Double = 0
+    If gripCm > 0 Then gripIn = gripCm / 2.54
+    If screwWasherIn < 0 Then screwWasherIn = 0
+    If nutWasherIn < 0 Then nutWasherIn = 0
+    If nutIn < 0 Then nutIn = 0
+    Dim required As Double = gripIn + screwWasherIn + nutWasherIn + nutIn
+    If required < 0 Then required = 0
+    Return required
+End Function
+
 ' Shown before the screw file window. Lengths are inches under the head.
 Function MGHScrewLengthMessage(sizeName As String, gripIn As Double, screwWasherIn As Double, nutWasherIn As Double, nutIn As Double, _
-    folderName As String, tooShort As Boolean) As String
+    folderName As String, tooShort As Boolean, holeCount As Integer, groupText As String) As String
     If gripIn < 0 Then gripIn = 0
     If screwWasherIn < 0 Then screwWasherIn = 0
     If nutWasherIn < 0 Then nutWasherIn = 0
     If nutIn < 0 Then nutIn = 0
     Dim required As Double = gripIn + screwWasherIn + nutWasherIn + nutIn
-    Dim text As String = "The " & sizeName & " screw must be at least " & MGHFormatInches(required) & " in under the head." & vbCrLf & vbCrLf & _
-        "Distance from the hole rim to the plate face: " & MGHFormatInches(gripIn) & " in" & vbCrLf
+    Dim text As String = "Select a " & sizeName & " screw at least " & MGHFormatInches(required) & " in under the head." & vbCrLf
+    If holeCount > 0 Then
+        text &= "This length is for " & holeCount.ToString() & " hole"
+        If holeCount <> 1 Then text &= "s"
+        If groupText IsNot Nothing AndAlso groupText <> "" Then text &= " in " & groupText
+        text &= "." & vbCrLf
+    End If
+    text &= vbCrLf & "Distance from the hole rim to the plate face: " & MGHFormatInches(gripIn) & " in" & vbCrLf
     If screwWasherIn > 0 Then text &= "Washer under the screw: " & MGHFormatInches(screwWasherIn) & " in" & vbCrLf
     If nutWasherIn > 0 Then text &= "Washer under the nut: " & MGHFormatInches(nutWasherIn) & " in" & vbCrLf
     If nutIn > 0 Then text &= "Nut: " & MGHFormatInches(nutIn) & " in" & vbCrLf
@@ -3235,35 +3289,19 @@ Function MGHPlateHardwareSeat(app As Inventor.Application, plateOcc As Inventor.
     Return True
 End Function
 
-Function MGHMaxGripCm(app As Inventor.Application, _
-    groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup), _
-    sizeName As String, plateOcc As Inventor.ComponentOccurrence) As Double
-    Dim maxSpan As Double = 0
-    Dim haveSpan As Boolean = False
-    If groups Is Nothing OrElse plateOcc Is Nothing Then Return 0
-    For Each g As OutputGroup In groups.Values
-        If g.Screw Is Nothing OrElse Not String.Equals(g.Screw.Trim(), sizeName, System.StringComparison.OrdinalIgnoreCase) Then Continue For
-        Dim centerIndex As Integer
-        For centerIndex = 0 To g.Centers.Count - 1
-            Dim rim As MGHComponentRim = Nothing
-            If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
-            If rim Is Nothing Then Continue For
-            Dim platePoint As Inventor.Point = g.Centers(centerIndex).Copy()
-            platePoint.TransformBy(plateOcc.Transformation)
-            Dim rimPoint As Inventor.Point = app.TransientGeometry.CreatePoint(rim.CenterX, rim.CenterY, rim.CenterZ)
-            Dim span As Double = platePoint.DistanceTo(rimPoint)
-            If Not haveSpan OrElse span > maxSpan Then
-                maxSpan = span
-                haveSpan = True
-            End If
-        Next
-    Next
-    If Not haveSpan Then Return -1
-    Return maxSpan
+' Distance from one clicked rim to the plate face, in centimeters. -1 when the rim was not recorded.
+Function MGHHoleGripCm(app As Inventor.Application, plateOcc As Inventor.ComponentOccurrence, _
+    center As Inventor.Point, rim As MGHComponentRim) As Double
+    If app Is Nothing OrElse plateOcc Is Nothing OrElse center Is Nothing OrElse rim Is Nothing Then Return -1
+    Dim platePoint As Inventor.Point = center.Copy()
+    platePoint.TransformBy(plateOcc.Transformation)
+    Dim rimPoint As Inventor.Point = app.TransientGeometry.CreatePoint(rim.CenterX, rim.CenterY, rim.CenterZ)
+    Return platePoint.DistanceTo(rimPoint)
 End Function
 
 Function MGHChooseScrewFile(app As Inventor.Application, library As String, sizeName As String, _
     gripIn As Double, screwWasherIn As Double, nutWasherIn As Double, nutIn As Double, _
+    holeCount As Integer, groupText As String, _
     notes As System.Collections.Generic.List(Of String)) As String
     Dim requiredInches As Double = gripIn + screwWasherIn + nutWasherIn + nutIn
     If requiredInches < 0 Then requiredInches = 0
@@ -3297,18 +3335,20 @@ Function MGHChooseScrewFile(app As Inventor.Application, library As String, size
             notes.Add(sizeName & " screw length needed: " & MGHFormatInches(requiredInches) & " in.")
         End If
     End If
-    Dim lengthText As String = MGHScrewLengthMessage(sizeName, gripIn, screwWasherIn, nutWasherIn, nutIn, folderLabel, tooShort)
-    If System.Windows.Forms.MessageBox.Show(lengthText, "Screw length", System.Windows.Forms.MessageBoxButtons.OKCancel) <> System.Windows.Forms.DialogResult.OK Then
-        notes.Add(sizeName & " screw was skipped.")
+    Dim lengthText As String = MGHScrewLengthMessage(sizeName, gripIn, screwWasherIn, nutWasherIn, nutIn, folderLabel, tooShort, holeCount, groupText)
+    Dim lengthTitle As String = MGHFormatInches(requiredInches) & " in — select the " & sizeName & " screw"
+    If holeCount > 0 Then lengthTitle &= " (" & holeCount.ToString() & " holes)"
+    If System.Windows.Forms.MessageBox.Show(lengthText, lengthTitle, System.Windows.Forms.MessageBoxButtons.OKCancel) <> System.Windows.Forms.DialogResult.OK Then
+        notes.Add(sizeName & " " & MGHFormatInches(requiredInches) & " in screw was skipped.")
         Return ""
     End If
-    Dim picked As String = MGHPickPartFile(app, "Select the " & sizeName & " screw, at least " & MGHFormatInches(requiredInches) & " in — " & startDir, startDir)
+    Dim picked As String = MGHPickPartFile(app, lengthTitle, startDir)
     If picked = "" Then
-        notes.Add(sizeName & " screw was skipped.")
+        notes.Add(sizeName & " " & MGHFormatInches(requiredInches) & " in screw was skipped.")
         Return ""
     End If
     If Not picked.EndsWith(".ipt", System.StringComparison.OrdinalIgnoreCase) OrElse Not System.IO.File.Exists(picked) Then
-        notes.Add(sizeName & " screw was skipped because the selected file is not an Inventor part.")
+        notes.Add(sizeName & " " & MGHFormatInches(requiredInches) & " in screw was skipped because the selected file is not an Inventor part.")
         Return ""
     End If
     Return picked
@@ -3318,6 +3358,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup), _
     plateOcc As Inventor.ComponentOccurrence, plateOutX As Double, plateOutY As Double, plateOutZ As Double) As String
     Dim notes As New System.Collections.Generic.List(Of String)()
+    Dim hardwareProgress As Inventor.ProgressBar = Nothing
     ' iLogic already has a transaction open on the assembly. Starting a second one
     ' raises E_FAIL, so these edits are not wrapped in another assembly transaction.
     Dim stepName As String = "Preparing washer placement"
@@ -3422,49 +3463,97 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     Dim chosenScrews As New System.Collections.Generic.Dictionary(Of String, String)(System.StringComparer.OrdinalIgnoreCase)
     If placeScrew Then
         stepName = "Choosing a screw"
-        For Each sizeName As String In sizes
+        Dim screwRequests As New System.Collections.Generic.List(Of MGHScrewRequest)()
+        Dim requestsByKey As New System.Collections.Generic.Dictionary(Of String, MGHScrewRequest)(System.StringComparer.OrdinalIgnoreCase)
+        For Each g As OutputGroup In groups.Values
+            If g.Screw Is Nothing Then Continue For
+            If MGHSizeFolderNames(g.Screw).Length = 0 Then Continue For
+            Dim sizeName As String = g.Screw.Trim()
             Dim washerCm As Double = 0
             If washerModels.ContainsKey(sizeName) Then washerCm = washerModels(sizeName).Thickness
-            Dim nutCount As Integer = 0
             Dim nutCm As Double = 0
-            If placeNut AndAlso nutModels.ContainsKey(sizeName) Then
-                nutCount = 1
-                nutCm = nutModels(sizeName).Thickness
-            End If
-            Dim gripCm As Double = MGHMaxGripCm(app, groups, sizeName, plateOcc)
-            If gripCm < 0 Then
-                gripCm = 0
-                notes.Add(sizeName & " screw length does not include the parts, because the hole rim was not recorded.")
-            End If
-            Dim gripIn As Double = gripCm / 2.54
+            If placeNut AndAlso nutModels.ContainsKey(sizeName) Then nutCm = nutModels(sizeName).Thickness
             Dim screwWasherIn As Double = 0
             Dim nutWasherIn As Double = 0
-            If washerCm > 0 Then
-                If placeUnderScrew Then screwWasherIn = washerCm / 2.54
-                If placeUnderNut Then nutWasherIn = washerCm / 2.54
-            End If
             Dim nutIn As Double = 0
-            If nutCount > 0 Then nutIn = nutCm / 2.54
-            Dim screwFile As String = MGHChooseScrewFile(app, library, sizeName, gripIn, screwWasherIn, nutWasherIn, nutIn, notes)
-            If screwFile <> "" Then chosenScrews.Add(sizeName, screwFile)
+            MGHScrewAllowances(washerCm, nutCm, placeUnderScrew, placeUnderNut, placeNut AndAlso nutCm > 0, screwWasherIn, nutWasherIn, nutIn)
+            Dim missingRim As Boolean = False
+            Dim centerIndex As Integer
+            For centerIndex = 0 To g.Centers.Count - 1
+                Dim rim As MGHComponentRim = Nothing
+                If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
+                Dim gripCm As Double = MGHHoleGripCm(app, plateOcc, g.Centers(centerIndex), rim)
+                If gripCm < 0 Then
+                    gripCm = 0
+                    missingRim = True
+                End If
+                Dim requiredInches As Double = MGHScrewRequiredInches(gripCm, screwWasherIn, nutWasherIn, nutIn)
+                Dim lengthKey As String = MGHScrewLengthKey(sizeName, requiredInches)
+                Dim request As MGHScrewRequest = Nothing
+                If Not requestsByKey.ContainsKey(lengthKey) Then
+                    request = New MGHScrewRequest()
+                    request.Key = lengthKey
+                    request.SizeName = sizeName
+                    request.RequiredInches = requiredInches
+                    request.GripIn = If(gripCm > 0, gripCm / 2.54, 0)
+                    request.ScrewWasherIn = screwWasherIn
+                    request.NutWasherIn = nutWasherIn
+                    request.NutIn = nutIn
+                    request.HoleCount = 1
+                    requestsByKey.Add(lengthKey, request)
+                    screwRequests.Add(request)
+                Else
+                    request = requestsByKey(lengthKey)
+                    request.HoleCount += 1
+                    Dim gripIn As Double = If(gripCm > 0, gripCm / 2.54, 0)
+                    If gripIn > request.GripIn Then
+                        request.GripIn = gripIn
+                        request.RequiredInches = requiredInches
+                    End If
+                End If
+                Dim groupLabel As String = ""
+                If g.Label IsNot Nothing Then groupLabel = g.Label.Trim()
+                If groupLabel <> "" AndAlso Not request.GroupLabels.Contains(groupLabel) Then request.GroupLabels.Add(groupLabel)
+            Next
+            If missingRim Then notes.Add(sizeName & " screw length does not include every part, because a hole rim was not recorded.")
+        Next
+        For Each request As MGHScrewRequest In screwRequests
+            Dim screwFile As String = MGHChooseScrewFile(app, library, request.SizeName, request.GripIn, request.ScrewWasherIn, request.NutWasherIn, request.NutIn, request.HoleCount, request.LabelText(), notes)
+            If screwFile <> "" Then chosenScrews.Add(request.Key, screwFile)
         Next
     End If
     Dim screwModels As New System.Collections.Generic.Dictionary(Of String, MGHWasherModel)(System.StringComparer.OrdinalIgnoreCase)
     stepName = "Reading the screw"
-    For Each sizeName As String In New System.Collections.Generic.List(Of String)(chosenScrews.Keys)
+    Dim screwByFile As New System.Collections.Generic.Dictionary(Of String, MGHWasherModel)(System.StringComparer.OrdinalIgnoreCase)
+    For Each lengthKey As String In New System.Collections.Generic.List(Of String)(chosenScrews.Keys)
+        Dim screwPath As String = chosenScrews(lengthKey)
+        If screwByFile.ContainsKey(screwPath) Then
+            If screwByFile(screwPath) Is Nothing Then
+                chosenScrews.Remove(lengthKey)
+            Else
+                screwModels.Add(lengthKey, screwByFile(screwPath))
+            End If
+            Continue For
+        End If
         Try
             stepName = "Opening the screw"
-            Dim screwModel As MGHWasherModel = MGHReadScrew(app, chosenScrews(sizeName))
+            Dim screwModel As MGHWasherModel = MGHReadScrew(app, screwPath)
             stepName = "Choosing the screw mounting face"
-            If Not MGHUseMountingFace(app, asm, screwModel, sizeName & " screw", faceHint, notes, "screw") Then
-                notes.Add(sizeName & " screw was skipped because its mounting face was not selected.")
-                chosenScrews.Remove(sizeName)
+            Dim lengthLabel As String = lengthKey
+            Dim barAt As Integer = lengthKey.LastIndexOf("|"c)
+            If barAt >= 0 AndAlso barAt < lengthKey.Length - 1 Then lengthLabel = lengthKey.Substring(barAt + 1) & " in " & lengthKey.Substring(0, barAt)
+            If Not MGHUseMountingFace(app, asm, screwModel, lengthLabel & " screw", faceHint, notes, "screw") Then
+                notes.Add(lengthLabel & " screw was skipped because its mounting face was not selected.")
+                screwByFile.Add(screwPath, Nothing)
+                chosenScrews.Remove(lengthKey)
             Else
-                screwModels.Add(sizeName, screwModel)
+                screwByFile.Add(screwPath, screwModel)
+                screwModels.Add(lengthKey, screwModel)
             End If
         Catch ex As System.Exception
-            notes.Add(sizeName & " screw was not placed while " & stepName & ": " & ex.Message)
-            chosenScrews.Remove(sizeName)
+            notes.Add(lengthKey & " screw was not placed while " & stepName & ": " & ex.Message)
+            screwByFile.Add(screwPath, Nothing)
+            chosenScrews.Remove(lengthKey)
         End Try
     Next
     If washerModels.Count = 0 AndAlso nutModels.Count = 0 AndAlso screwModels.Count = 0 Then
@@ -3476,17 +3565,67 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     Dim screwsPlaced As Integer = 0
     Dim replaced As Integer = 0
     stepName = "Placing hardware in the assembly"
+    Dim placeSteps As Integer = 0
+    For Each counted As OutputGroup In groups.Values
+        If counted.Screw Is Nothing Then Continue For
+        Dim countedSize As String = counted.Screw.Trim()
+        Dim countedWasher As Boolean = washerModels.ContainsKey(countedSize)
+        Dim countedNut As Boolean = nutModels.ContainsKey(countedSize)
+        Dim countedWasherCm As Double = 0
+        Dim countedNutCm As Double = 0
+        If countedWasher Then countedWasherCm = washerModels(countedSize).Thickness
+        If countedNut Then countedNutCm = nutModels(countedSize).Thickness
+        Dim countedScrewWasher As Double = 0
+        Dim countedNutWasher As Double = 0
+        Dim countedNutIn As Double = 0
+        MGHScrewAllowances(countedWasherCm, countedNutCm, placeUnderScrew, placeUnderNut, placeNut AndAlso countedNut, countedScrewWasher, countedNutWasher, countedNutIn)
+        Dim countedIndex As Integer
+        For countedIndex = 0 To counted.Centers.Count - 1
+            If countedWasher AndAlso placeUnderScrew Then placeSteps += 1
+            If countedWasher AndAlso placeUnderNut Then placeSteps += 1
+            If countedNut AndAlso placeNut Then placeSteps += 1
+            If placeScrew Then
+                Dim countedRim As MGHComponentRim = Nothing
+                If counted.Rims IsNot Nothing AndAlso countedIndex < counted.Rims.Count Then countedRim = counted.Rims(countedIndex)
+                Dim countedGrip As Double = MGHHoleGripCm(app, plateOcc, counted.Centers(countedIndex), countedRim)
+                Dim countedKey As String = MGHScrewLengthKey(countedSize, MGHScrewRequiredInches(countedGrip, countedScrewWasher, countedNutWasher, countedNutIn))
+                If screwModels.ContainsKey(countedKey) Then placeSteps += 1
+            End If
+        Next
+    Next
+    If placeSteps < 1 Then placeSteps = 1
+    Try
+        hardwareProgress = app.CreateProgressBar(False, placeSteps, "Grouped Mounting Holes - Placing Hardware")
+    Catch
+        hardwareProgress = Nothing
+    End Try
+    Dim placeIndex As Integer = 0
     Dim tg As Inventor.TransientGeometry = app.TransientGeometry
         For Each g As OutputGroup In groups.Values
             If g.Screw Is Nothing Then Continue For
             Dim sizeName As String = g.Screw.Trim()
             Dim washerModel As MGHWasherModel = Nothing
             Dim nutModel As MGHWasherModel = Nothing
-            Dim screwModel As MGHWasherModel = Nothing
             If washerModels.ContainsKey(sizeName) Then washerModel = washerModels(sizeName)
             If nutModels.ContainsKey(sizeName) Then nutModel = nutModels(sizeName)
-            If screwModels.ContainsKey(sizeName) Then screwModel = screwModels(sizeName)
-            If washerModel Is Nothing AndAlso nutModel Is Nothing AndAlso screwModel Is Nothing Then Continue For
+            Dim sizeHasScrew As Boolean = False
+            If placeScrew Then
+                For Each lengthKey As String In screwModels.Keys
+                    If lengthKey.StartsWith(sizeName & "|", System.StringComparison.OrdinalIgnoreCase) Then
+                        sizeHasScrew = True
+                        Exit For
+                    End If
+                Next
+            End If
+            If washerModel Is Nothing AndAlso nutModel Is Nothing AndAlso Not sizeHasScrew Then Continue For
+            Dim groupWasherCm As Double = 0
+            Dim groupNutCm As Double = 0
+            If washerModel IsNot Nothing Then groupWasherCm = washerModel.Thickness
+            If nutModel IsNot Nothing Then groupNutCm = nutModel.Thickness
+            Dim groupScrewWasher As Double = 0
+            Dim groupNutWasher As Double = 0
+            Dim groupNutIn As Double = 0
+            MGHScrewAllowances(groupWasherCm, groupNutCm, placeUnderScrew, placeUnderNut, placeNut AndAlso nutModel IsNot Nothing, groupScrewWasher, groupNutWasher, groupNutIn)
             Dim centerIndex As Integer
             For centerIndex = 0 To g.Centers.Count - 1
                 Dim center As Inventor.Point = g.Centers(centerIndex)
@@ -3502,6 +3641,8 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     If washerModel Is Nothing Then Continue For
                     If underNut AndAlso Not placeUnderNut Then Continue For
                     If Not underNut AndAlso Not placeUnderScrew Then Continue For
+                    placeIndex += 1
+                    MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " " & If(underNut, "washer under nut", "washer under screw") & " (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim onSelectedRim As Boolean = MGHWasherUsesSelectedRim(underNut, nutOnSelectedRim)
                     Dim endName As String = If(onSelectedRim, "Selected", "Opposite")
                     Dim endWord As String = If(onSelectedRim, "rim", "plate")
@@ -3542,6 +3683,8 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     End If
                 Next
                 If placeNut AndAlso nutModel IsNot Nothing Then
+                    placeIndex += 1
+                    MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " nut (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim nutOnRim As Boolean = MGHWasherUsesSelectedRim(True, nutOnSelectedRim)
                     Dim nutEnd As String = If(nutOnRim, "Selected", "Opposite")
                     Dim nutWord As String = If(nutOnRim, "rim", "plate")
@@ -3580,7 +3723,12 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                             "Nut", sizeName, center, nutEnd, "Nut", chosenNuts(sizeName), "nut", Not stackOnWasher, notes, replaced)
                     End If
                 End If
+                Dim screwKey As String = MGHScrewLengthKey(sizeName, MGHScrewRequiredInches(MGHHoleGripCm(app, plateOcc, center, rim), groupScrewWasher, groupNutWasher, groupNutIn))
+                Dim screwModel As MGHWasherModel = Nothing
+                If screwModels.ContainsKey(screwKey) Then screwModel = screwModels(screwKey)
                 If placeScrew AndAlso screwModel IsNot Nothing Then
+                    placeIndex += 1
+                    MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " " & screwKey.Substring(screwKey.LastIndexOf("|"c) + 1) & " in screw (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim screwOnRim As Boolean = MGHWasherUsesSelectedRim(False, nutOnSelectedRim)
                     Dim screwEnd As String = If(screwOnRim, "Selected", "Opposite")
                     Dim screwWord As String = If(screwOnRim, "rim", "plate")
@@ -3611,7 +3759,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         Dim screwCenterText As String = MGHFormatPoint(center)
                         screwsPlaced += MGHPlaceHardwareItem(app, asm, screwModel, screwContact, screwOutward, screwEdge, screwHost, _
                             "MGH Screw " & sizeName & " " & screwWord & " [" & screwCenterText & "]", _
-                            "Screw", sizeName, center, screwEnd, "Screw", chosenScrews(sizeName), "screw", Not stackOnWasher, notes, replaced)
+                            "Screw", sizeName, center, screwEnd, "Screw", chosenScrews(screwKey), "screw", Not stackOnWasher, notes, replaced)
                     ElseIf rim IsNot Nothing OrElse Not screwOnRim Then
                         notes.Add(sizeName & " screw at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
                     End If
@@ -3631,8 +3779,21 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             summary.Append(vbCrLf & "- " & noteText)
         Next
     End If
+    If hardwareProgress IsNot Nothing Then
+        Try
+            hardwareProgress.Close()
+        Catch
+        End Try
+        hardwareProgress = Nothing
+    End If
     Return summary.ToString()
     Catch ex As System.Exception
+        If hardwareProgress IsNot Nothing Then
+            Try
+                hardwareProgress.Close()
+            Catch
+            End Try
+        End If
         Return "Hardware was not placed during " & stepName & "." & vbCrLf & ex.Message
     End Try
 End Function
