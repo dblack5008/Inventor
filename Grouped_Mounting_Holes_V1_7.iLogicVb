@@ -16,6 +16,7 @@
 ' After the holes succeed, the rule can place washers from the hardware library.
 ' The nut side chooses the end: a washer under the nut sits there, and a washer under the screw sits on the other end.
 ' A nut sits on the nut end, outside the washer under the nut when that washer is placed.
+' The first time a nut is used, click the face that sits against the washer. That face is saved in the nut part's iProperties.
 ' The file prompt opens Hardware\<size>\Washers or Hardware\<size>\Nuts. Screws are not placed yet.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
@@ -920,9 +921,9 @@ Public Class MGHWasherSideDialog
         Me.MaximizeBox = False : Me.MinimizeBox = False
         Dim note As New System.Windows.Forms.Label()
         note.Left = 14 : note.Top = 12 : note.Width = 516 : note.Height = 58
-        note.Text = "Checked washers are placed on both ends when both washer boxes are checked." & vbCrLf & _
+        note.Text = "Both washer boxes place one washer on each end of the component hole." & vbCrLf & _
             "The nut sits on the nut end, outside the washer under the nut. Screws are not placed yet." & vbCrLf & _
-            "The next windows open that size's Washers or Nuts folder so you can pick the .ipt."
+            "The first nut asks for the face against the washer, then saves that face on the part."
         Me.Controls.Add(note)
         Dim libraryLabel As New System.Windows.Forms.Label()
         libraryLabel.Left = 14 : libraryLabel.Top = 80 : libraryLabel.Width = 80 : libraryLabel.Height = 22
@@ -1690,6 +1691,58 @@ Function MGHFarthestRim(selX As Double, selY As Double, selZ As Double, _
     Return best
 End Function
 
+' A chamfer or countersink can be the opening the washer sits on, so the far rim may be larger than the hole.
+Function MGHChainRadiusOk(radius As Double, selRadius As Double) As Boolean
+    If radius <= 0.02 OrElse selRadius <= 0 Then Return False
+    If radius < selRadius * 0.35 Then Return False
+    If radius > selRadius * 4.0 + 0.05 Then Return False
+    Return True
+End Function
+
+' Farthest coaxial rim in the chamfer band. -1 when none qualifies.
+Function MGHChooseChainExit(selX As Double, selY As Double, selZ As Double, _
+    axisX As Double, axisY As Double, axisZ As Double, selRadius As Double, _
+    candidates As System.Collections.Generic.List(Of MGHRimCandidate)) As Integer
+    If candidates Is Nothing Then Return -1
+    Dim axisTol As Double = System.Math.Max(0.1, selRadius * 0.35)
+    Dim best As Integer = -1
+    Dim bestDist As Double = 0
+    Dim i As Integer
+    For i = 0 To candidates.Count - 1
+        Dim c As MGHRimCandidate = candidates(i)
+        If c Is Nothing Then Continue For
+        If Not MGHChainRadiusOk(c.Radius, selRadius) Then Continue For
+        If MGHDistanceToAxis(c.X, c.Y, c.Z, selX, selY, selZ, axisX, axisY, axisZ) > axisTol Then Continue For
+        Dim dx As Double = c.X - selX
+        Dim dy As Double = c.Y - selY
+        Dim dz As Double = c.Z - selZ
+        Dim dist As Double = System.Math.Sqrt(dx * dx + dy * dy + dz * dz)
+        If dist < 0.02 Then Continue For
+        If best < 0 OrElse dist > bestDist + 0.0000001 Then
+            best = i
+            bestDist = dist
+        End If
+    Next
+    Return best
+End Function
+
+' Thickness between the first two ray hits, or -1 when the hits are not a through hole.
+Function MGHExitThickness(firstDist As Double, secondDist As Double) As Double
+    If firstDist < -0.001 OrElse secondDist < firstDist + 0.02 Then Return -1
+    If secondDist - firstDist > 15 Then Return -1
+    Return secondDist - firstDist
+End Function
+
+' Parameter t where point + t * direction meets the plane. NaN when the line is parallel to the plane.
+Function MGHLinePlaneT(dirX As Double, dirY As Double, dirZ As Double, _
+    px As Double, py As Double, pz As Double, _
+    nx As Double, ny As Double, nz As Double, _
+    qx As Double, qy As Double, qz As Double) As Double
+    Dim denom As Double = nx * dirX + ny * dirY + nz * dirZ
+    If System.Math.Abs(denom) < 0.000000001 Then Return System.Double.NaN
+    Return ((qx - px) * nx + (qy - py) * ny + (qz - pz) * nz) / denom
+End Function
+
 ' Assembly point of the far rim. rotatedDx/Dy/Dz is the part-space vector from the
 ' clicked center to the far center after the occurrence rotation. The proxy circle
 ' normal is not used: Inventor often flips it, which put both washers on the clicked rim.
@@ -1867,6 +1920,226 @@ Function MGHReadWasher(app As Inventor.Application, path As String) As MGHWasher
     model.BearingEdge = bearingEdge
     model.FilePath = path
     Return model
+End Function
+
+Function MGHCustomProperties(doc As Inventor.Document) As Inventor.PropertySet
+    Return doc.PropertySets.Item("{D5CDD505-2E9C-101B-9397-08002B2CF9AE}")
+End Function
+
+Function MGHReadCustomProperty(doc As Inventor.Document, propName As String) As String
+    Try
+        Dim prop As Inventor.Property = MGHCustomProperties(doc).Item(propName)
+        If prop Is Nothing OrElse prop.Value Is Nothing Then Return ""
+        Return System.Convert.ToString(prop.Value)
+    Catch
+        Return ""
+    End Try
+End Function
+
+Sub MGHWriteCustomProperty(doc As Inventor.Document, propName As String, propValue As String)
+    Dim props As Inventor.PropertySet = MGHCustomProperties(doc)
+    Dim existing As Inventor.Property = Nothing
+    Try
+        existing = props.Item(propName)
+    Catch
+        existing = Nothing
+    End Try
+    If existing Is Nothing Then
+        props.Add(propValue, propName, System.Reflection.Missing.Value)
+    Else
+        existing.Value = propValue
+    End If
+End Sub
+
+' The saved face is the one that sits against the washer. Nothing when it has not been chosen or no longer binds.
+Function MGHLoadMountingFace(part As Inventor.PartDocument) As Inventor.Face
+    Dim keyText As String = MGHReadCustomProperty(part, "MGH Mounting Face")
+    Dim contextText As String = MGHReadCustomProperty(part, "MGH Mounting Face Context")
+    If keyText = "" OrElse contextText = "" Then Return Nothing
+    Dim ctxData() As Byte = System.Convert.FromBase64String(contextText)
+    Dim ctx As Integer = part.ReferenceKeyManager.LoadContextFromArray(ctxData)
+    Try
+        Dim key() As Byte = New Byte() {}
+        part.ReferenceKeyManager.StringToKey(keyText, key)
+        Dim matchType As Object = Nothing
+        Dim bound As Object = part.ReferenceKeyManager.BindKeyToObject(key, ctx, matchType)
+        Dim face As Inventor.Face = TryCast(bound, Inventor.Face)
+        If face Is Nothing Then
+            Dim many As Inventor.ObjectCollection = TryCast(bound, Inventor.ObjectCollection)
+            If many IsNot Nothing AndAlso many.Count > 0 Then face = TryCast(many.Item(1), Inventor.Face)
+        End If
+        Return face
+    Finally
+        Try
+            part.ReferenceKeyManager.ReleaseKeyContext(ctx)
+        Catch
+        End Try
+    End Try
+End Function
+
+Sub MGHSaveMountingFace(part As Inventor.PartDocument, face As Inventor.Face)
+    Dim ctx As Integer = part.ReferenceKeyManager.CreateKeyContext()
+    Try
+        Dim key() As Byte = New Byte() {}
+        face.GetReferenceKey(key, ctx)
+        Dim ctxData() As Byte = New Byte() {}
+        part.ReferenceKeyManager.SaveContextToArray(ctx, ctxData)
+        MGHWriteCustomProperty(part, "MGH Mounting Face", part.ReferenceKeyManager.KeyToString(key))
+        MGHWriteCustomProperty(part, "MGH Mounting Face Context", System.Convert.ToBase64String(ctxData))
+    Finally
+        Try
+            part.ReferenceKeyManager.ReleaseKeyContext(ctx)
+        Catch
+        End Try
+    End Try
+End Sub
+
+' Point the nut so the chosen face is the contact and the body extends away from that face.
+Sub MGHSetBearingFromFace(model As MGHWasherModel, face As Inventor.Face, app As Inventor.Application)
+    If model Is Nothing OrElse face Is Nothing Then Throw New System.Exception("the mounting face is missing")
+    Dim pl As Inventor.Plane = TryCast(face.Geometry, Inventor.Plane)
+    If pl Is Nothing Then Throw New System.Exception("Click the flat face that sits against the washer.")
+    Dim dirX As Double = model.AxisX
+    Dim dirY As Double = model.AxisY
+    Dim dirZ As Double = model.AxisZ
+    If Not MGHNormalize(dirX, dirY, dirZ) Then Throw New System.Exception("the nut hole has no axis")
+    If System.Math.Abs(pl.Normal.X * dirX + pl.Normal.Y * dirY + pl.Normal.Z * dirZ) < 0.95 Then
+        Throw New System.Exception("That face is not perpendicular to the nut hole. Click the flat face around the hole.")
+    End If
+    Dim t As Double = MGHLinePlaneT(dirX, dirY, dirZ, model.BearingX, model.BearingY, model.BearingZ, _
+        pl.Normal.X, pl.Normal.Y, pl.Normal.Z, pl.RootPoint.X, pl.RootPoint.Y, pl.RootPoint.Z)
+    If System.Double.IsNaN(t) Then Throw New System.Exception("That face does not cross the nut hole.")
+    If System.Math.Abs(t) > 0.2 AndAlso System.Math.Abs(System.Math.Abs(t) - model.Thickness) > 0.2 Then
+        Throw New System.Exception("That face is not an end of the nut. Click the flat face around the hole.")
+    End If
+    model.BearingX = model.BearingX + dirX * t
+    model.BearingY = model.BearingY + dirY * t
+    model.BearingZ = model.BearingZ + dirZ * t
+    Dim body As Inventor.SurfaceBody = face.SurfaceBody
+    Dim faceOut As Inventor.UnitVector = MGHFaceOutward(face, body, app)
+    model.AxisX = -faceOut.X
+    model.AxisY = -faceOut.Y
+    model.AxisZ = -faceOut.Z
+    Dim rx As Double, ry As Double, rz As Double
+    If System.Math.Abs(model.AxisX) < 0.9 Then
+        MGHCross(model.AxisX, model.AxisY, model.AxisZ, 1, 0, 0, rx, ry, rz)
+    Else
+        MGHCross(model.AxisX, model.AxisY, model.AxisZ, 0, 1, 0, rx, ry, rz)
+    End If
+    If MGHNormalize(rx, ry, rz) AndAlso body IsNot Nothing Then
+        Dim probe() As Double = { _
+            model.BearingX + model.AxisX * 0.04 + rx * (model.InnerRadius + 0.04), _
+            model.BearingY + model.AxisY * 0.04 + ry * (model.InnerRadius + 0.04), _
+            model.BearingZ + model.AxisZ * 0.04 + rz * (model.InnerRadius + 0.04)}
+        Try
+            If body.IsPointInside(probe, False) <> Inventor.ContainmentEnum.kInsideContainment Then
+                model.AxisX = faceOut.X
+                model.AxisY = faceOut.Y
+                model.AxisZ = faceOut.Z
+            End If
+        Catch
+        End Try
+    End If
+    model.MidX = model.BearingX + model.AxisX * model.Thickness / 2.0
+    model.MidY = model.BearingY + model.AxisY * model.Thickness / 2.0
+    model.MidZ = model.BearingZ + model.AxisZ * model.Thickness / 2.0
+    Dim bearingEdge As Inventor.Edge = Nothing
+    Dim bearingGap As Double = 0
+    Dim haveEdge As Boolean = False
+    Try
+        For Each e As Inventor.Edge In face.Edges
+            Dim edgeCenter As Inventor.Point = Nothing
+            Dim edgeRadius As Double = 0
+            If Not MGHCircularEdge(e, edgeCenter, edgeRadius) Then Continue For
+            Dim gap As Double = System.Math.Abs(edgeRadius - model.InnerRadius)
+            If Not haveEdge OrElse gap < bearingGap Then
+                bearingEdge = e
+                bearingGap = gap
+                haveEdge = True
+            End If
+        Next
+    Catch
+    End Try
+    If haveEdge Then model.BearingEdge = bearingEdge
+End Sub
+
+' Asks once, in the assembly, and writes the face reference onto the nut part.
+Function MGHUseMountingFace(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    model As MGHWasherModel, roleLabel As String, hint As Inventor.Point, _
+    notes As System.Collections.Generic.List(Of String)) As Boolean
+    If model Is Nothing OrElse model.Part Is Nothing Then Return False
+    Dim saved As Inventor.Face = Nothing
+    Try
+        saved = MGHLoadMountingFace(model.Part)
+    Catch
+        saved = Nothing
+    End Try
+    If saved IsNot Nothing Then
+        Try
+            MGHSetBearingFromFace(model, saved, app)
+            Return True
+        Catch
+            saved = Nothing
+        End Try
+    End If
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim matrix As Inventor.Matrix = tg.CreateMatrix()
+    If hint IsNot Nothing Then matrix.SetTranslation(tg.CreateVector(hint.X, hint.Y, hint.Z), False)
+    Dim tempOcc As Inventor.ComponentOccurrence = Nothing
+    Try
+        tempOcc = asm.ComponentDefinition.Occurrences.AddByComponentDefinition(model.Part.ComponentDefinition, matrix)
+        Try
+            tempOcc.Grounded = True
+        Catch
+        End Try
+        Try
+            tempOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Mounting Face")
+        Catch
+        End Try
+        Dim pickedFace As Inventor.Face = Nothing
+        Do
+            Dim selector As New MGHInteractionSelector()
+            Dim gotFace As Boolean = selector.Run(app, Inventor.SelectionFilterEnum.kPartFacePlanarFilter, _
+                "Nut mounting face", _
+                "Click the flat metal face of " & tempOcc.Name & " that sits against the washer, opposite the nylon. Cancel skips this nut.", _
+                True)
+            If Not gotFace OrElse selector.Picked.Count = 0 Then Return False
+            Dim proxy As Inventor.FaceProxy = TryCast(selector.Picked(0), Inventor.FaceProxy)
+            If proxy Is Nothing OrElse proxy.ContainingOccurrence Is Nothing OrElse _
+                Not String.Equals(proxy.ContainingOccurrence.Name, tempOcc.Name, System.StringComparison.OrdinalIgnoreCase) Then
+                System.Windows.Forms.MessageBox.Show("Click a flat face on " & tempOcc.Name & ".", "Nut mounting face")
+                Continue Do
+            End If
+            pickedFace = proxy.NativeObject
+            If pickedFace Is Nothing Then
+                System.Windows.Forms.MessageBox.Show("That face could not be read from the nut part.", "Nut mounting face")
+                Continue Do
+            End If
+            Try
+                MGHSetBearingFromFace(model, pickedFace, app)
+                Exit Do
+            Catch ex As System.Exception
+                System.Windows.Forms.MessageBox.Show(ex.Message, "Nut mounting face")
+                pickedFace = Nothing
+            End Try
+        Loop
+        MGHSaveMountingFace(model.Part, pickedFace)
+        If model.Part.IsModifiable Then
+            model.Part.Save()
+            notes.Add(roleLabel & " mounting face saved on " & System.IO.Path.GetFileName(model.FilePath) & ". Delete the MGH Mounting Face iProperties to choose it again.")
+        Else
+            notes.Add(roleLabel & " mounting face was used, but " & System.IO.Path.GetFileName(model.FilePath) & " is read-only so it was not saved.")
+        End If
+        Return True
+    Finally
+        If tempOcc IsNot Nothing Then
+            Try
+                tempOcc.Delete()
+            Catch
+                If notes IsNot Nothing Then notes.Add("The temporary nut used to choose the mounting face could not be removed.")
+            End Try
+        End If
+    End Try
 End Function
 
 Function MGHMatrixMoved(app As Inventor.Application, before As Inventor.Matrix, after As Inventor.Matrix) As Boolean
@@ -2186,36 +2459,216 @@ Function MGHNativeSelectedEdge(rim As MGHComponentRim) As Inventor.Edge
     Return rim.SelectedEdge
 End Function
 
-Function MGHOppositeComponentEdge(selected As Inventor.Edge) As Inventor.Edge
-    If selected Is Nothing Then Return Nothing
-    Dim circ As Inventor.Circle = TryCast(selected.Geometry, Inventor.Circle)
-    If circ Is Nothing Then Return Nothing
-    Dim body As Inventor.SurfaceBody = Nothing
-    For Each f As Inventor.Face In selected.Faces
-        body = f.SurfaceBody
-        If body IsNot Nothing Then Exit For
+Function MGHReadEdgeCircle(edge As Inventor.Edge, ByRef cx As Double, ByRef cy As Double, ByRef cz As Double, _
+    ByRef radius As Double, ByRef ax As Double, ByRef ay As Double, ByRef az As Double) As Boolean
+    cx = 0 : cy = 0 : cz = 0 : radius = 0 : ax = 0 : ay = 0 : az = 0
+    If edge Is Nothing Then Return False
+    Try
+        Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
+        If circ IsNot Nothing AndAlso circ.Radius > 0 Then
+            cx = circ.Center.X : cy = circ.Center.Y : cz = circ.Center.Z
+            radius = circ.Radius
+            ax = circ.Normal.X : ay = circ.Normal.Y : az = circ.Normal.Z
+            Return MGHNormalize(ax, ay, az)
+        End If
+        Dim arc As Inventor.Arc3d = TryCast(edge.Geometry, Inventor.Arc3d)
+        If arc IsNot Nothing AndAlso arc.Radius > 0 Then
+            cx = arc.Center.X : cy = arc.Center.Y : cz = arc.Center.Z
+            radius = arc.Radius
+            ax = arc.Normal.X : ay = arc.Normal.Y : az = arc.Normal.Z
+            Return MGHNormalize(ax, ay, az)
+        End If
+    Catch
+    End Try
+    Return False
+End Function
+
+Function MGHListHasFace(faces As System.Collections.Generic.List(Of Inventor.Face), face As Inventor.Face) As Boolean
+    If faces Is Nothing OrElse face Is Nothing Then Return False
+    For Each known As Inventor.Face In faces
+        If known Is face Then Return True
     Next
-    If body Is Nothing Then Return Nothing
-    Dim candidates As New System.Collections.Generic.List(Of MGHRimCandidate)()
-    Dim edges As New System.Collections.Generic.List(Of Inventor.Edge)()
-    For Each f As Inventor.Face In body.Faces
-        For Each ed As Inventor.Edge In f.Edges
-            Dim edgeCenter As Inventor.Point = Nothing
-            Dim edgeRadius As Double = 0
-            If Not MGHCircularEdge(ed, edgeCenter, edgeRadius) Then Continue For
-            Dim sample As New MGHRimCandidate()
-            sample.X = edgeCenter.X
-            sample.Y = edgeCenter.Y
-            sample.Z = edgeCenter.Z
-            sample.Radius = edgeRadius
-            candidates.Add(sample)
-            edges.Add(ed)
+    Return False
+End Function
+
+Function MGHListHasEdge(edges As System.Collections.Generic.List(Of Inventor.Edge), edge As Inventor.Edge) As Boolean
+    If edges Is Nothing OrElse edge Is Nothing Then Return False
+    For Each known As Inventor.Edge In edges
+        If known Is edge Then Return True
+    Next
+    Return False
+End Function
+
+' Cylinder, cone, or hole fillet sharing the selected hole axis.
+Function MGHRoundHoleFace(face As Inventor.Face, cx As Double, cy As Double, cz As Double, _
+    radius As Double, ax As Double, ay As Double, az As Double) As Boolean
+    If face Is Nothing Then Return False
+    Try
+        Dim cyl As Inventor.Cylinder = TryCast(face.Geometry, Inventor.Cylinder)
+        If cyl IsNot Nothing Then
+            If System.Math.Abs(cyl.AxisVector.X * ax + cyl.AxisVector.Y * ay + cyl.AxisVector.Z * az) < 0.95 Then Return False
+            If MGHDistanceToAxis(cyl.BasePoint.X, cyl.BasePoint.Y, cyl.BasePoint.Z, cx, cy, cz, ax, ay, az) > System.Math.Max(0.15, radius * 0.5) Then Return False
+            If cyl.Radius > radius * 4.0 + 0.05 Then Return False
+            Return True
+        End If
+        Dim cone As Inventor.Cone = TryCast(face.Geometry, Inventor.Cone)
+        If cone IsNot Nothing Then
+            If System.Math.Abs(cone.AxisVector.X * ax + cone.AxisVector.Y * ay + cone.AxisVector.Z * az) < 0.95 Then Return False
+            If MGHDistanceToAxis(cone.BasePoint.X, cone.BasePoint.Y, cone.BasePoint.Z, cx, cy, cz, ax, ay, az) > System.Math.Max(0.2, radius) Then Return False
+            Return True
+        End If
+        Dim tor As Inventor.Torus = TryCast(face.Geometry, Inventor.Torus)
+        If tor IsNot Nothing Then
+            If System.Math.Abs(tor.AxisVector.X * ax + tor.AxisVector.Y * ay + tor.AxisVector.Z * az) < 0.95 Then Return False
+            If MGHDistanceToAxis(tor.CenterPoint.X, tor.CenterPoint.Y, tor.CenterPoint.Z, cx, cy, cz, ax, ay, az) > System.Math.Max(0.2, radius) Then Return False
+            If tor.MajorRadius > radius * 4.0 + 0.05 Then Return False
+            Return True
+        End If
+    Catch
+    End Try
+    Return False
+End Function
+
+' Circular rims reached by walking the hole wall, including a chamfer or countersink on the far face.
+Function MGHCollectHoleRims(selected As Inventor.Edge, cx As Double, cy As Double, cz As Double, _
+    radius As Double, ax As Double, ay As Double, az As Double) As System.Collections.Generic.List(Of Inventor.Edge)
+    Dim found As New System.Collections.Generic.List(Of Inventor.Edge)()
+    Dim pending As New System.Collections.Generic.List(Of Inventor.Face)()
+    Dim seenFaces As New System.Collections.Generic.List(Of Inventor.Face)()
+    Dim seenEdges As New System.Collections.Generic.List(Of Inventor.Edge)()
+    Try
+        For Each startFace As Inventor.Face In selected.Faces
+            pending.Add(startFace)
         Next
+    Catch
+    End Try
+    Dim cursor As Integer = 0
+    Do While cursor < pending.Count AndAlso seenFaces.Count < 40
+        Dim face As Inventor.Face = pending(cursor)
+        cursor += 1
+        If face Is Nothing OrElse MGHListHasFace(seenFaces, face) Then Continue Do
+        seenFaces.Add(face)
+        Dim roundFace As Boolean = MGHRoundHoleFace(face, cx, cy, cz, radius, ax, ay, az)
+        Dim planeFace As Boolean = False
+        Try
+            planeFace = TypeOf face.Geometry Is Inventor.Plane
+        Catch
+            planeFace = False
+        End Try
+        If Not roundFace AndAlso Not planeFace Then Continue Do
+        Try
+            For Each ed As Inventor.Edge In face.Edges
+                If ed Is Nothing OrElse MGHListHasEdge(seenEdges, ed) Then Continue For
+                seenEdges.Add(ed)
+                Dim ex As Double, ey As Double, ez As Double, er As Double, eax As Double, eay As Double, eaz As Double
+                If MGHReadEdgeCircle(ed, ex, ey, ez, er, eax, eay, eaz) AndAlso MGHChainRadiusOk(er, radius) Then
+                    If MGHDistanceToAxis(ex, ey, ez, cx, cy, cz, ax, ay, az) <= System.Math.Max(0.1, radius * 0.35) Then
+                        found.Add(ed)
+                    End If
+                End If
+                If roundFace Then
+                    Try
+                        For Each neighbor As Inventor.Face In ed.Faces
+                            If neighbor IsNot Nothing AndAlso Not MGHListHasFace(seenFaces, neighbor) Then pending.Add(neighbor)
+                        Next
+                    Catch
+                    End Try
+                End If
+            Next
+        Catch
+        End Try
+    Loop
+    Return found
+End Function
+
+' Far circular rim in the same coordinate space as selected. False when this hole has no other rim.
+Function MGHFarRimOfEdge(selected As Inventor.Edge, ByRef farEdge As Inventor.Edge, _
+    ByRef farX As Double, ByRef farY As Double, ByRef farZ As Double) As Boolean
+    farEdge = Nothing
+    farX = 0 : farY = 0 : farZ = 0
+    Dim cx As Double, cy As Double, cz As Double, radius As Double, ax As Double, ay As Double, az As Double
+    If Not MGHReadEdgeCircle(selected, cx, cy, cz, radius, ax, ay, az) Then Return False
+    Dim edges As System.Collections.Generic.List(Of Inventor.Edge) = MGHCollectHoleRims(selected, cx, cy, cz, radius, ax, ay, az)
+    Dim candidates As New System.Collections.Generic.List(Of MGHRimCandidate)()
+    Dim kept As New System.Collections.Generic.List(Of Inventor.Edge)()
+    For Each ed As Inventor.Edge In edges
+        Dim ex As Double, ey As Double, ez As Double, er As Double, eax As Double, eay As Double, eaz As Double
+        If Not MGHReadEdgeCircle(ed, ex, ey, ez, er, eax, eay, eaz) Then Continue For
+        Dim sample As New MGHRimCandidate()
+        sample.X = ex : sample.Y = ey : sample.Z = ez : sample.Radius = er
+        candidates.Add(sample)
+        kept.Add(ed)
     Next
-    Dim index As Integer = MGHChooseOppositeRim(circ.Center.X, circ.Center.Y, circ.Center.Z, _
-        circ.Normal.X, circ.Normal.Y, circ.Normal.Z, circ.Radius, candidates)
-    If index < 0 Then Return Nothing
-    Return edges(index)
+    Dim index As Integer = MGHChooseChainExit(cx, cy, cz, ax, ay, az, radius, candidates)
+    If index < 0 Then Return False
+    farEdge = kept(index)
+    farX = candidates(index).X : farY = candidates(index).Y : farZ = candidates(index).Z
+    Return True
+End Function
+
+' Exit point of the hole when the far opening is not a circle. Coordinates match the edge.
+Function MGHHoleExitPoint(app As Inventor.Application, edge As Inventor.Edge, _
+    ByRef farX As Double, ByRef farY As Double, ByRef farZ As Double) As Boolean
+    farX = 0 : farY = 0 : farZ = 0
+    Dim cx As Double, cy As Double, cz As Double, radius As Double, ax As Double, ay As Double, az As Double
+    If Not MGHReadEdgeCircle(edge, cx, cy, cz, radius, ax, ay, az) Then Return False
+    Dim body As Inventor.SurfaceBody = Nothing
+    Dim planar As Inventor.Face = Nothing
+    Try
+        For Each f As Inventor.Face In edge.Faces
+            If body Is Nothing Then body = f.SurfaceBody
+            If planar Is Nothing AndAlso TypeOf f.Geometry Is Inventor.Plane Then planar = f
+        Next
+    Catch
+        Return False
+    End Try
+    If body Is Nothing OrElse planar Is Nothing Then Return False
+    Dim outward As Inventor.UnitVector = Nothing
+    Try
+        outward = MGHFaceOutward(planar, body, app)
+    Catch
+        Return False
+    End Try
+    Dim ix As Double = -outward.X
+    Dim iy As Double = -outward.Y
+    Dim iz As Double = -outward.Z
+    Dim rx As Double, ry As Double, rz As Double
+    If System.Math.Abs(ax) < 0.9 Then
+        MGHCross(ax, ay, az, 1, 0, 0, rx, ry, rz)
+    Else
+        MGHCross(ax, ay, az, 0, 1, 0, rx, ry, rz)
+    End If
+    If Not MGHNormalize(rx, ry, rz) Then Return False
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim dir As Inventor.UnitVector = tg.CreateUnitVector(ix, iy, iz)
+    Dim radialTry As Integer
+    For radialTry = 0 To 1
+        Dim radial As Double = If(radialTry = 0, radius + 0.08, radius * 1.8 + 0.08)
+        Dim start As Inventor.Point = tg.CreatePoint( _
+            cx + rx * radial + outward.X * 0.1, _
+            cy + ry * radial + outward.Y * 0.1, _
+            cz + rz * radial + outward.Z * 0.1)
+        Dim found As Inventor.ObjectsEnumerator = Nothing
+        Dim hits As Inventor.ObjectsEnumerator = Nothing
+        Try
+            body.FindUsingRay(start, dir, 0.02, found, hits, False)
+        Catch
+            hits = Nothing
+        End Try
+        If hits Is Nothing OrElse hits.Count < 2 Then Continue For
+        Dim firstPt As Inventor.Point = TryCast(hits.Item(1), Inventor.Point)
+        Dim secondPt As Inventor.Point = TryCast(hits.Item(2), Inventor.Point)
+        If firstPt Is Nothing OrElse secondPt Is Nothing Then Continue For
+        Dim d1 As Double = (firstPt.X - start.X) * ix + (firstPt.Y - start.Y) * iy + (firstPt.Z - start.Z) * iz
+        Dim d2 As Double = (secondPt.X - start.X) * ix + (secondPt.Y - start.Y) * iy + (secondPt.Z - start.Z) * iz
+        Dim thickness As Double = MGHExitThickness(d1, d2)
+        If thickness < 0 Then Continue For
+        farX = cx + ix * thickness
+        farY = cy + iy * thickness
+        farZ = cz + iz * thickness
+        Return True
+    Next
+    Return False
 End Function
 
 Function MGHNativeEdgeOutward(edge As Inventor.Edge, app As Inventor.Application) As Inventor.UnitVector
@@ -2255,41 +2708,36 @@ Function MGHComponentWasherSeat(app As Inventor.Application, rim As MGHComponent
     Dim axisX As Double = rim.AxisX / axisLen
     Dim axisY As Double = rim.AxisY / axisLen
     Dim axisZ As Double = rim.AxisZ / axisLen
-    Dim oppositeEdge As Inventor.Edge = Nothing
-    Try
-        oppositeEdge = MGHOppositeComponentEdge(nativeEdge)
-    Catch
-        oppositeEdge = Nothing
-    End Try
     Dim tg As Inventor.TransientGeometry = app.TransientGeometry
     Dim selectedAsm As Inventor.Point = tg.CreatePoint(rim.CenterX, rim.CenterY, rim.CenterZ)
     Dim farAsm As Inventor.Point = Nothing
     Dim farEdge As Inventor.Edge = Nothing
-    If oppositeEdge IsNot Nothing Then
-        Dim nativeFar As Inventor.Point = Nothing
-        Dim nativeFarRadius As Double = 0
-        If MGHCircularEdge(oppositeEdge, nativeFar, nativeFarRadius) Then
-            ' Rotate the part-space hole vector into the assembly, then add it to the
-            ' clicked rim. This stays on the other end even when the rim normal is flipped.
-            Dim originPt As Inventor.Point = tg.CreatePoint(0, 0, 0)
-            Dim tipPt As Inventor.Point = tg.CreatePoint( _
-                nativeFar.X - nativeCirc.Center.X, nativeFar.Y - nativeCirc.Center.Y, nativeFar.Z - nativeCirc.Center.Z)
-            originPt.TransformBy(rim.Component.Transformation)
-            tipPt.TransformBy(rim.Component.Transformation)
-            Dim farX As Double, farY As Double, farZ As Double
-            MGHFarRimPoint(selectedAsm.X, selectedAsm.Y, selectedAsm.Z, _
-                tipPt.X - originPt.X, tipPt.Y - originPt.Y, tipPt.Z - originPt.Z, farX, farY, farZ)
-            farAsm = tg.CreatePoint(farX, farY, farZ)
-            If farAsm.DistanceTo(selectedAsm) < 0.02 Then farAsm = Nothing
-        End If
-        If farAsm IsNot Nothing Then
-            Try
-                Dim proxyObj As Object = Nothing
-                rim.Component.CreateGeometryProxy(oppositeEdge, proxyObj)
-                farEdge = TryCast(proxyObj, Inventor.Edge)
-            Catch
-                farEdge = Nothing
-            End Try
+    ' The clicked rim is already an assembly proxy, so walk that hole in assembly space.
+    ' A chamfer or countersink is accepted. A non-circular exit still yields a point.
+    Dim haveFar As Boolean = False
+    Dim asmFarX As Double, asmFarY As Double, asmFarZ As Double
+    Try
+        haveFar = MGHFarRimOfEdge(rim.SelectedEdge, farEdge, asmFarX, asmFarY, asmFarZ)
+    Catch
+        haveFar = False
+    End Try
+    If Not haveFar Then
+        farEdge = Nothing
+        Try
+            haveFar = MGHHoleExitPoint(app, rim.SelectedEdge, asmFarX, asmFarY, asmFarZ)
+        Catch
+            haveFar = False
+        End Try
+    End If
+    If haveFar Then
+        Dim placedX As Double, placedY As Double, placedZ As Double
+        MGHFarRimPoint(selectedAsm.X, selectedAsm.Y, selectedAsm.Z, _
+            asmFarX - selectedAsm.X, asmFarY - selectedAsm.Y, asmFarZ - selectedAsm.Z, _
+            placedX, placedY, placedZ)
+        farAsm = tg.CreatePoint(placedX, placedY, placedZ)
+        If farAsm.DistanceTo(selectedAsm) < 0.02 Then
+            farAsm = Nothing
+            farEdge = Nothing
         End If
     End If
     Dim dirX As Double = 0
@@ -2492,9 +2940,24 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             chosenWashers.Remove(sizeName)
         End Try
     Next
+    Dim faceHint As Inventor.Point = Nothing
+    For Each hinted As OutputGroup In groups.Values
+        If hinted.Rims IsNot Nothing AndAlso hinted.Rims.Count > 0 AndAlso hinted.Rims(0) IsNot Nothing Then
+            faceHint = app.TransientGeometry.CreatePoint(hinted.Rims(0).CenterX, hinted.Rims(0).CenterY, hinted.Rims(0).CenterZ)
+            Exit For
+        End If
+    Next
     For Each sizeName As String In New System.Collections.Generic.List(Of String)(chosenNuts.Keys)
         Try
-            nutModels.Add(sizeName, MGHReadWasher(app, chosenNuts(sizeName)))
+            stepName = "Reading the nut"
+            Dim nutModel As MGHWasherModel = MGHReadWasher(app, chosenNuts(sizeName))
+            stepName = "Choosing the nut mounting face"
+            If Not MGHUseMountingFace(app, asm, nutModel, sizeName & " nut", faceHint, notes) Then
+                notes.Add(sizeName & " nut was skipped because its mounting face was not selected.")
+                chosenNuts.Remove(sizeName)
+            Else
+                nutModels.Add(sizeName, nutModel)
+            End If
         Catch ex As System.Exception
             notes.Add(sizeName & " nut was not placed (" & ex.Message & ").")
             chosenNuts.Remove(sizeName)
