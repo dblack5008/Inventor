@@ -71,6 +71,18 @@ Sub Main()
 
     Dim invertPlate As Inventor.Matrix = plateOcc.Transformation.Copy()
     invertPlate.Invert()
+    ' Record the outward direction while the selected face is still valid.
+    ' Cutting the holes can invalidate that face, and reading it afterward raises E_FAIL.
+    Dim plateOutwardX As Double = platePlane.Normal.X
+    Dim plateOutwardY As Double = platePlane.Normal.Y
+    Dim plateOutwardZ As Double = platePlane.Normal.Z
+    Try
+        Dim plateOutward As Inventor.UnitVector = MGHFaceOutward(plateNativeFace, plateNativeFace.SurfaceBody, app)
+        plateOutwardX = plateOutward.X
+        plateOutwardY = plateOutward.Y
+        plateOutwardZ = plateOutward.Z
+    Catch
+    End Try
 
     ' Custom labeled options replace misleading Yes / No buttons.
     Dim modeDialog As New MGHModeDialog()
@@ -643,7 +655,7 @@ Sub Main()
         End If
         Dim washerSummary As String = ""
         Try
-            washerSummary = MGHPlaceWashers(app, aDoc, plateOcc, plateDef, plateNativeFace, desiredGroups)
+            washerSummary = MGHPlaceWashers(app, aDoc, plateOcc, plateDef, plateOutwardX, plateOutwardY, plateOutwardZ, desiredGroups)
         Catch washerEx As System.Exception
             washerSummary = "Washers were not placed." & vbCrLf & washerEx.Message
         End Try
@@ -1645,26 +1657,50 @@ Sub MGHWriteHardwareLibrary(doc As Inventor.Document, path As String)
     MGHPutAttr(aset, "HardwareLibrary", path)
 End Sub
 
+Function MGHIsUserCancel(ex As System.Exception) As Boolean
+    If ex Is Nothing Then Return False
+    If ex.HResult = &H80004004 Then Return True
+    If ex.Message Is Nothing Then Return False
+    Return ex.Message.IndexOf("80004004", System.StringComparison.OrdinalIgnoreCase) >= 0
+End Function
+
 Function MGHPickPartFile(app As Inventor.Application, title As String, initialDirectory As String) As String
-    Dim dialog As Inventor.FileDialog = Nothing
-    app.CreateFileDialog(dialog)
-    dialog.Filter = "Inventor Parts (*.ipt)|*.ipt"
-    dialog.FilterIndex = 1
-    dialog.DialogTitle = title
-    dialog.CancelError = True
-    dialog.InsertMode = False
-    dialog.OptionsEnabled = False
-    dialog.MultiSelectEnabled = False
-    If initialDirectory <> "" AndAlso System.IO.Directory.Exists(initialDirectory) Then
-        dialog.InitialDirectory = initialDirectory
-    End If
+    Dim folder As String = ""
+    If initialDirectory <> "" AndAlso System.IO.Directory.Exists(initialDirectory) Then folder = initialDirectory
     Try
+        Dim dialog As Inventor.FileDialog = Nothing
+        app.CreateFileDialog(dialog)
+        dialog.Filter = "Inventor Parts (*.ipt)|*.ipt"
+        dialog.DialogTitle = title
+        dialog.CancelError = True
+        Try
+            dialog.InsertMode = False
+        Catch
+        End Try
+        If folder <> "" Then dialog.InitialDirectory = folder
         dialog.ShowOpen()
-    Catch
+        If dialog.FileName Is Nothing Then Return ""
+        Dim selected As String = dialog.FileName.Trim()
+        If selected <> "" AndAlso System.IO.File.Exists(selected) Then Return selected
         Return ""
+    Catch ex As System.Exception
+        If MGHIsUserCancel(ex) Then Return ""
     End Try
-    If dialog.FileName Is Nothing Then Return ""
-    Return dialog.FileName.Trim()
+    ' Inventor's file dialog raises E_FAIL for some option combinations.
+    ' The standard window still opens in the Washers folder.
+    Dim browser As New System.Windows.Forms.OpenFileDialog()
+    browser.Title = title
+    browser.Filter = "Inventor parts (*.ipt)|*.ipt"
+    browser.CheckFileExists = True
+    browser.RestoreDirectory = True
+    If folder <> "" Then
+        browser.InitialDirectory = folder
+        browser.FileName = folder & System.IO.Path.DirectorySeparatorChar
+    End If
+    Dim picked As String = ""
+    If browser.ShowDialog() = System.Windows.Forms.DialogResult.OK Then picked = browser.FileName
+    browser.Dispose()
+    Return picked
 End Function
 
 Function MGHBrowseHardwareLibrary(currentPath As String) As String
@@ -1974,11 +2010,12 @@ Function MGHUniqueOccurrenceName(occs As Inventor.ComponentOccurrences, requeste
     Throw New System.Exception("Could not find an unused component name.")
 End Function
 
-Sub MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    centers As System.Collections.Generic.List(Of Inventor.Point))
+Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    centers As System.Collections.Generic.List(Of Inventor.Point), keep As Inventor.ComponentOccurrence) As Integer
     Dim doomed As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)()
     For Each occ As Inventor.ComponentOccurrence In asm.ComponentDefinition.Occurrences
         Try
+            If keep IsNot Nothing AndAlso occ Is keep Then Continue For
             If Not occ.AttributeSets.NameIsUsed("MGH_Hardware") Then Continue For
             Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
             If Not String.Equals(MGHGetAttr(aset, "Role"), "Washer", System.StringComparison.Ordinal) Then Continue For
@@ -1993,10 +2030,13 @@ Sub MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocu
         Catch
         End Try
     Next
+    Dim removed As Integer = 0
     For Each occ As Inventor.ComponentOccurrence In doomed
         occ.Delete()
+        removed += 1
     Next
-End Sub
+    Return removed
+End Function
 
 ' Empty result means the insert constraint seated the washer. Otherwise the washer is grounded in place.
 Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
@@ -2074,8 +2114,13 @@ End Function
 
 Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
     plateOcc As Inventor.ComponentOccurrence, plateDef As Inventor.PartComponentDefinition, _
-    plateFace As Inventor.Face, groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup)) As String
+    outwardX As Double, outwardY As Double, outwardZ As Double, _
+    groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup)) As String
     Dim notes As New System.Collections.Generic.List(Of String)()
+    ' iLogic already has a transaction open on the assembly. Starting a second one
+    ' raises E_FAIL, so these edits are not wrapped in another assembly transaction.
+    Dim stepName As String = "Preparing washer placement"
+    Try
     Dim sizes As New System.Collections.Generic.List(Of String)()
     For Each g As OutputGroup In groups.Values
         Dim folderNames() As String = MGHSizeFolderNames(g.Screw)
@@ -2106,12 +2151,18 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
         If browsed = "" OrElse Not System.IO.Directory.Exists(browsed) Then Return "Washers: skipped. The hardware folder was not found."
         library = browsed
     End If
+    stepName = "Saving the hardware folder"
     If library.Length > 255 Then
         notes.Add("The hardware folder path is longer than 255 characters, so it will not be remembered on the assembly.")
     Else
-        MGHWriteHardwareLibrary(asm, library)
+        Try
+            MGHWriteHardwareLibrary(asm, library)
+        Catch
+            notes.Add("The hardware folder could not be saved on the assembly. Placement will continue.")
+        End Try
     End If
 
+    stepName = "Choosing a washer file"
     Dim chosen As New System.Collections.Generic.Dictionary(Of String, String)(System.StringComparer.OrdinalIgnoreCase)
     For Each sizeName As String In sizes
         Dim washerDir As String = MGHResolveRoleDirectory(library, sizeName, "Washers")
@@ -2140,6 +2191,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
         Return "Washers: no files selected." & If(notes.Count = 0, "", vbCrLf & String.Join(vbCrLf, notes.ToArray()))
     End If
 
+    stepName = "Reading the washer part"
     Dim models As New System.Collections.Generic.Dictionary(Of String, MGHWasherModel)(System.StringComparer.OrdinalIgnoreCase)
     Dim chosenSizes As New System.Collections.Generic.List(Of String)(chosen.Keys)
     For Each sizeName As String In chosenSizes
@@ -2154,23 +2206,13 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
         Return "Washers were not placed." & vbCrLf & String.Join(vbCrLf, notes.ToArray())
     End If
 
-    Dim targetCenters As New System.Collections.Generic.List(Of Inventor.Point)()
-    For Each g As OutputGroup In groups.Values
-        If g.Screw Is Nothing OrElse Not models.ContainsKey(g.Screw.Trim()) Then Continue For
-        For Each center As Inventor.Point In g.Centers
-            targetCenters.Add(center)
-        Next
-    Next
-
     Dim placed As Integer = 0
     Dim replaced As Integer = 0
-    Dim trans As Inventor.Transaction = app.TransactionManager.StartTransaction(asm, "Place Grouped Mounting Washers")
-    Try
-        Dim beforeDelete As Integer = asm.ComponentDefinition.Occurrences.Count
-        MGHRemoveWashersAt(app, asm, targetCenters)
-        replaced = beforeDelete - asm.ComponentDefinition.Occurrences.Count
-        Dim outwardPlate As Inventor.UnitVector = MGHFaceOutward(plateFace, plateFace.SurfaceBody, app)
-        Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    stepName = "Placing washers in the assembly"
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim outwardLen As Double = System.Math.Sqrt(outwardX * outwardX + outwardY * outwardY + outwardZ * outwardZ)
+    If outwardLen < 0.000000001 Then Throw New System.Exception("The selected face has no outward direction.")
+    Dim outwardPlate As Inventor.UnitVector = tg.CreateUnitVector(outwardX / outwardLen, outwardY / outwardLen, outwardZ / outwardLen)
         For Each g As OutputGroup In groups.Values
             If g.Screw Is Nothing OrElse Not models.ContainsKey(g.Screw.Trim()) Then Continue For
             Dim model As MGHWasherModel = models(g.Screw.Trim())
@@ -2232,6 +2274,13 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     MGHPutAttr(aset, "Center", MGHFormatPoint(center))
                     MGHPutAttr(aset, "Side", If(onSelectedFace, "Selected", "Opposite"))
                     MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
+                    Dim oneCenter As New System.Collections.Generic.List(Of Inventor.Point)()
+                    oneCenter.Add(center)
+                    Try
+                        replaced += MGHRemoveWashersAt(app, asm, oneCenter, washerOcc)
+                    Catch
+                        notes.Add("The previous washer at " & MGHFormatPoint(center) & " could not be removed.")
+                    End Try
                     kept = True
                     placed += 1
                     If warning <> "" Then notes.Add(sizeName & " washer " & washerOcc.Name & " was " & warning & ".")
@@ -2246,21 +2295,6 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                 End Try
             Next
         Next
-        If placed = 0 Then
-            Dim hadPrevious As Boolean = replaced > 0
-            trans.Abort()
-            replaced = 0
-            If hadPrevious Then notes.Add("Existing washers were left in place.")
-        Else
-            trans.End()
-        End If
-    Catch ex As System.Exception
-        Try
-            trans.Abort()
-        Catch
-        End Try
-        Throw New System.Exception("Washer placement was rolled back. " & ex.Message)
-    End Try
     app.StatusBarText = ""
 
     Dim summary As New System.Text.StringBuilder()
@@ -2273,6 +2307,9 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
         Next
     End If
     Return summary.ToString()
+    Catch ex As System.Exception
+        Return "Washers were not placed during " & stepName & "." & vbCrLf & ex.Message
+    End Try
 End Function
 
 
