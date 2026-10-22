@@ -20,6 +20,7 @@
 ' The first time a nut or screw is used, click the face that sits against the washer. That face is saved on the part.
 ' Before each screw file window, the rule shows the length under the head: rim-to-plate span, washers, and nut.
 ' Holes that need a different length get their own screw. The file window opens Hardware\<size>\Screws\<length>Lg.
+' Placed hardware keeps the part file's own name in the assembly browser.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -2542,8 +2543,8 @@ Sub MGHOffsetPoint(x As Double, y As Double, z As Double, ux As Double, uy As Do
     oz = z + uz * distance
 End Sub
 
-' A placed part is named "MGH Washer #4 opposite [x,y,z]" or "MGH Nut #4 opposite [x,y,z]"
-' so a later run can replace that end even when the assembly refuses to store attributes.
+' Older placements were renamed "MGH Nut #6 plate [x,y,z]". New placements keep the part file name.
+' The old name is still recognized so a later run can replace those parts.
 Function MGHCenterTextFromWasherName(name As String) As String
     If name Is Nothing OrElse name = "" Then Return ""
     Dim washerName As Boolean = name.StartsWith("MGH Washer ", System.StringComparison.OrdinalIgnoreCase)
@@ -3068,7 +3069,7 @@ End Function
 Function MGHPlaceHardwareItem(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
     model As MGHWasherModel, contact As Inventor.Point, outward As Inventor.UnitVector, _
     holeEdge As Inventor.Edge, host As Inventor.ComponentOccurrence, _
-    displayName As String, roleName As String, sizeName As String, center As Inventor.Point, _
+    roleName As String, sizeName As String, center As Inventor.Point, _
     endName As String, station As String, sourceFile As String, roleLabel As String, _
     constrainToHole As Boolean, notes As System.Collections.Generic.List(Of String), _
     ByRef replaced As Integer) As Integer
@@ -3081,11 +3082,8 @@ Function MGHPlaceHardwareItem(app As Inventor.Application, asm As Inventor.Assem
         action = "adding the " & roleLabel & " to the assembly"
         hardwareOcc = MGHAddWasherOccurrence(asm, model, matrix)
         kept = True
+        ' Leave the occurrence name Inventor assigned from the part file.
         Dim centerText As String = MGHFormatPoint(center)
-        Try
-            hardwareOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, displayName)
-        Catch
-        End Try
         Dim warning As String = ""
         Try
             If constrainToHole AndAlso holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
@@ -3645,7 +3643,6 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " " & If(underNut, "washer under nut", "washer under screw") & " (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim onSelectedRim As Boolean = MGHWasherUsesSelectedRim(underNut, nutOnSelectedRim)
                     Dim endName As String = If(onSelectedRim, "Selected", "Opposite")
-                    Dim endWord As String = If(onSelectedRim, "rim", "plate")
                     Dim roleLabel As String = If(underNut, "washer under nut", "washer under screw")
                     Dim contact As Inventor.Point = Nothing
                     Dim outwardAsm As Inventor.UnitVector = Nothing
@@ -3667,9 +3664,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
                         Continue For
                     End If
-                    Dim centerText As String = MGHFormatPoint(center)
                     Dim added As Integer = MGHPlaceHardwareItem(app, asm, washerModel, contact, outwardAsm, holeEdge, host, _
-                        "MGH Washer " & sizeName & " " & endWord & " [" & centerText & "]", _
                         "Washer", sizeName, center, endName, If(underNut, "UnderNut", "UnderScrew"), _
                         chosenWashers(sizeName), roleLabel, True, notes, replaced)
                     washersPlaced += added
@@ -3687,7 +3682,6 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " nut (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim nutOnRim As Boolean = MGHWasherUsesSelectedRim(True, nutOnSelectedRim)
                     Dim nutEnd As String = If(nutOnRim, "Selected", "Opposite")
-                    Dim nutWord As String = If(nutOnRim, "rim", "plate")
                     Dim nutContact As Inventor.Point = Nothing
                     Dim nutOutward As Inventor.UnitVector = Nothing
                     Dim nutEdge As Inventor.Edge = Nothing
@@ -3717,9 +3711,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                                 nutWasherThickness, stackedX, stackedY, stackedZ)
                             nutContact = tg.CreatePoint(stackedX, stackedY, stackedZ)
                         End If
-                        Dim nutCenterText As String = MGHFormatPoint(center)
                         nutsPlaced += MGHPlaceHardwareItem(app, asm, nutModel, nutContact, nutOutward, nutEdge, nutHost, _
-                            "MGH Nut " & sizeName & " " & nutWord & " [" & nutCenterText & "]", _
                             "Nut", sizeName, center, nutEnd, "Nut", chosenNuts(sizeName), "nut", Not stackOnWasher, notes, replaced)
                     End If
                 End If
@@ -3731,7 +3723,6 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     MGHProgressTick(hardwareProgress, app, "Placing " & sizeName & " " & screwKey.Substring(screwKey.LastIndexOf("|"c) + 1) & " in screw (" & placeIndex.ToString() & " of " & placeSteps.ToString() & ")")
                     Dim screwOnRim As Boolean = MGHWasherUsesSelectedRim(False, nutOnSelectedRim)
                     Dim screwEnd As String = If(screwOnRim, "Selected", "Opposite")
-                    Dim screwWord As String = If(screwOnRim, "rim", "plate")
                     Dim screwContact As Inventor.Point = Nothing
                     Dim screwOutward As Inventor.UnitVector = Nothing
                     Dim screwEdge As Inventor.Edge = Nothing
@@ -3756,9 +3747,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                                 screwWasherThickness, stackedX, stackedY, stackedZ)
                             screwContact = tg.CreatePoint(stackedX, stackedY, stackedZ)
                         End If
-                        Dim screwCenterText As String = MGHFormatPoint(center)
                         screwsPlaced += MGHPlaceHardwareItem(app, asm, screwModel, screwContact, screwOutward, screwEdge, screwHost, _
-                            "MGH Screw " & sizeName & " " & screwWord & " [" & screwCenterText & "]", _
                             "Screw", sizeName, center, screwEnd, "Screw", chosenScrews(screwKey), "screw", Not stackOnWasher, notes, replaced)
                     ElseIf rim IsNot Nothing OrElse Not screwOnRim Then
                         notes.Add(sizeName & " screw at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
