@@ -10,7 +10,9 @@
 ' seat diameter and angle are reapplied AFTER clearance association and
 ' VERIFIED again after part recompute. No silent reversion to table defaults.
 ' Supports native clearance holes, tapped holes, custom holes, and none/counterbore/countersink/spotface seats.
-' Group identity includes the entire size/thread/seat specification, with one feature per group.
+' Group identity is the size, thread, seat, and clearance specification. The group name is not part of it.
+' A name change updates the existing feature. A specification change does not, and the rule explains why before cutting.
+' Each identity field is its own attribute (Inventor string attributes hold 255 characters). The set is copied with the feature.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -180,6 +182,17 @@ Sub Main()
         buckets(key).Centers.Add(m.Center)
     Next
 
+    ' Restore saved group names before the review grid is built. The grid's
+    ' suggested name is not the feature identity; overwriting a stored name
+    ' on every run would discard a rename.
+    Dim planeID As String = StablePlaneKey(platePlane)
+    Try
+        MGHApplyStoredLabels(buckets, plateDef, planeID)
+    Catch ex As System.Exception
+        System.Windows.Forms.MessageBox.Show("Existing grouped holes could not be read:" & vbCrLf & ex.Message, "Grouped Mounting Holes")
+        Exit Sub
+    End Try
+
     Dim review As New HoleReviewForm(buckets)
     review.Text = "Grouped Mounting Holes - " & plateDoc.DisplayName
     Dim outcome As System.Windows.Forms.DialogResult = review.ShowDialog()
@@ -189,14 +202,12 @@ Sub Main()
     ' Create a SECOND, clearly labeled progress bar *before* the checks start.
     Dim reviewProgress As Inventor.ProgressBar = Nothing
     Dim reviewOperation As String = "Preparing review"
-    Dim planeID As String = ""
     Dim desiredGroups As New System.Collections.Generic.SortedDictionary(Of String, OutputGroup)(System.StringComparer.Ordinal)
     Dim preview As New System.Text.StringBuilder()
     Try
         Dim reviewSteps As Integer = 4 + buckets.Count + selected.Count
         reviewProgress = app.CreateProgressBar(False, reviewSteps, "Grouped Mounting Holes - Reviewing / Validating")
         MGHProgressTick(reviewProgress, app, "Collecting selected mounting-hole specifications")
-        planeID = StablePlaneKey(platePlane)
         For Each b As InputBucket In buckets.Values
             reviewOperation = "Validating specification for source Ø" & b.SourceKey
             MGHProgressMessage(reviewProgress, app, reviewOperation)
@@ -225,18 +236,29 @@ Sub Main()
                     Throw New System.Exception("Seat Ø must exceed the hole Ø for " & b.GroupLabel)
                 End If
             End If
-            Dim legacyKey As String = planeID & "|" & b.Screw & "|" & b.Fit & "|" & _
-                b.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
-                "|" & b.GroupLabel.Trim().ToUpperInvariant()
-            Dim key As String = legacyKey & "|V16|" & b.Mode.ToUpperInvariant() & "|" & b.Seat.ToUpperInvariant() & _
-                "|" & b.SeatDiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
-                "|" & b.SeatDepthIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
-                "|" & b.SeatAngleDeg.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) & _
-                "|" & b.ThreadType.Trim().ToUpperInvariant() & "|" & b.ThreadDesignation.Trim().ToUpperInvariant() & "|" & b.ThreadClass.Trim().ToUpperInvariant() & _
-                "|" & b.ClearanceStandard.Trim().ToUpperInvariant() & "|" & b.ClearanceFamily.Trim().ToUpperInvariant()
+            MGHRequireStorable("Group name", b.GroupLabel)
+            MGHRequireStorable("Fastener", b.Screw)
+            MGHRequireStorable("Fit", b.Fit)
+            MGHRequireStorable("Hole type", b.Mode)
+            MGHRequireStorable("Seat", b.Seat)
+            MGHRequireStorable("Thread type", b.ThreadType)
+            MGHRequireStorable("Thread designation", b.ThreadDesignation)
+            MGHRequireStorable("Thread class", b.ThreadClass)
+            MGHRequireStorable("Clearance standard", b.ClearanceStandard)
+            MGHRequireStorable("Clearance family", b.ClearanceFamily)
+            Dim diameterText As String = b.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture)
+            Dim key As String = MGHSpecKeyFromBucket(planeID, b)
+            If desiredGroups.ContainsKey(key) AndAlso _
+               Not String.Equals(desiredGroups(key).Label, b.GroupLabel.Trim(), System.StringComparison.OrdinalIgnoreCase) Then
+                Throw New System.Exception("Two rows use the same hole specification but different group names ('" & _
+                    desiredGroups(key).Label & "' and '" & b.GroupLabel.Trim() & "'). " & _
+                    "The name is not part of the feature identity. Use one name, or change the specification.")
+            End If
             If Not desiredGroups.ContainsKey(key) Then
                 Dim g As New OutputGroup()
-                g.Key = key : g.LegacyKey = legacyKey
+                g.Key = key
+                g.LegacyKey = MGHSizeKey(planeID, b.Screw, b.Fit, diameterText)
+                g.PlaneId = planeID
                 g.Label = b.GroupLabel.Trim() : g.DiameterIn = b.DiameterIn
                 g.Screw = b.Screw : g.Fit = b.Fit : g.Mode = b.Mode : g.Seat = b.Seat
                 g.SeatDiameterIn = b.SeatDiameterIn : g.SeatDepthIn = b.SeatDepthIn : g.SeatAngleDeg = b.SeatAngleDeg
@@ -249,6 +271,10 @@ Sub Main()
             Next
             MGHProgressTick(reviewProgress, app, "Grouped source Ø" & b.SourceKey & " — " & b.Centers.Count.ToString() & " positions")
         Next
+
+        reviewOperation = "Comparing specifications with existing grouped holes"
+        MGHProgressMessage(reviewProgress, app, reviewOperation)
+        Dim nameNotes As System.Collections.Generic.List(Of String) = MGHDescribeExistingGroups(plateDef, desiredGroups)
 
         ' Test full seat envelope (NOT only pilot/core hole diameter).
         reviewOperation = "Checking selected face boundaries and hole/seat interference"
@@ -323,6 +349,13 @@ Sub Main()
                 preview.AppendLine("- " & msg)
             Next
         End If
+        If nameNotes.Count > 0 Then
+            preview.AppendLine()
+            preview.AppendLine("Existing features with this specification:")
+            For Each note As String In nameNotes
+                preview.AppendLine("- " & note)
+            Next
+        End If
         preview.AppendLine()
         preview.Append("Verify the specifications, then choose GENERATE HOLES to proceed.")
         MGHProgressTick(reviewProgress, app, "Validation finished — ready for final confirmation")
@@ -359,30 +392,17 @@ Sub Main()
         trans = app.TransactionManager.StartTransaction(plateDoc, "Generate Grouped Mounting Holes")
         MGHProgressTick(progress, app, "Plate transaction started - checking existing groups")
         Dim holes As Inventor.HoleFeatures = plateDef.Features.HoleFeatures
+        Dim featureIndex As MGHFeatureIndex = MGHLoadFeatureIndex(plateDef)
         Dim existing As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
-        For Each feat As Inventor.HoleFeature In holes
-            Try
-                If feat.AttributeSets.NameIsUsed("MGH_Generator") Then
-                    Dim att As Inventor.AttributeSet = feat.AttributeSets.Item("MGH_Generator")
-                    Dim savedKey As String = CStr(att.Item("GroupKey").Value)
-                    If existing.ContainsKey(savedKey) Then Throw New System.Exception("Duplicate internal group identifiers")
-                    existing.Add(savedKey, feat)
-                End If
-            Catch ex As System.Exception
-                If ex.Message = "Duplicate internal group identifiers" Then Throw
-                ' Unrecognized legacy feature metadata is deliberately ignored.
-            End Try
-        Next
-
-        ' Upgrade the identity of V1.5 simple groups when their original spec matches.
-        ' Do not migrate legacy sketches into newly seated or threaded groups.
         Dim migrateLegacy As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
         For Each g As OutputGroup In desiredGroups.Values
-            If Not existing.ContainsKey(g.Key) AndAlso g.Mode = "Clearance" AndAlso g.Seat = "None" Then
-                If existing.ContainsKey(g.LegacyKey) Then
-                    existing.Add(g.Key, existing(g.LegacyKey))
-                    migrateLegacy.Add(g.Key, existing(g.LegacyKey))
-                End If
+            If featureIndex.BySpec.ContainsKey(g.Key) Then
+                existing.Add(g.Key, featureIndex.BySpec(g.Key))
+            ElseIf g.Mode = "Clearance" AndAlso g.Seat = "None" AndAlso featureIndex.ByV15Size.ContainsKey(g.LegacyKey) Then
+                ' V1.5 stored only screw, fit, diameter, and the display name.
+                ' Upgrade that feature when the new request is still a plain clearance hole.
+                existing.Add(g.Key, featureIndex.ByV15Size(g.LegacyKey))
+                migrateLegacy.Add(g.Key, featureIndex.ByV15Size(g.LegacyKey))
             End If
         Next
         MGHProgressTick(progress, app, "Existing groups indexed - preparing " & desiredGroups.Count.ToString() & " size groups")
@@ -397,6 +417,7 @@ Sub Main()
         Dim inwardDirections As New System.Collections.Generic.Dictionary(Of String, Inventor.PartFeatureExtentDirectionEnum)(System.StringComparer.Ordinal)
         Dim interiorTestPoints As New System.Collections.Generic.Dictionary(Of String, System.Collections.Generic.List(Of Inventor.Point))(System.StringComparer.Ordinal)
         Dim flippedGroups As Integer = 0
+        Dim renamedGroups As Integer = 0
         Dim namingWarnings As New System.Collections.Generic.List(Of String)()
         Dim skippedDuplicates As Integer = 0
         Dim newPoints As Integer = 0
@@ -509,24 +530,8 @@ Sub Main()
             If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
                 flippedGroups += 1
             End If
-            ' Feature metadata is authoritative for adding holes on subsequent runs;
-            ' the display names are best-effort conveniences.
             operationInfo = "Recording group identity: " & g.Label
-            Dim aset As Inventor.AttributeSet = h.AttributeSets.Add("MGH_Generator")
-            aset.Add("GroupKey", Inventor.ValueTypeEnum.kStringType, g.Key)
-            operationInfo = "Labeling created group: " & g.Label
-            Dim specificationTag As String = If(g.Mode="Threaded", g.ThreadDesignation, _
-                "D" & g.DiameterIn.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture))
-            Try
-                h.Name = UniqueHoleName(holes, "MGH - " & CleanName(g.Label) & " - " & specificationTag, h)
-            Catch renameEx As System.Exception
-                namingWarnings.Add("Hole feature for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
-            End Try
-            Try
-                sk.Name = UniqueSketchName(plateDef, "MGH Sketch - " & CleanName(g.Label) & " - " & specificationTag, sk)
-            Catch renameEx As System.Exception
-                namingWarnings.Add("Sketch for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
-            End Try
+            MGHPersistIdentity(h, g, holes, plateDef, sk, namingWarnings)
             newGroups += 1
             MGHProgressTick(progress, app, "New group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & " completed: " & g.Label)
         Next
@@ -540,6 +545,13 @@ Sub Main()
             operationInfo = "Checking existing group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
             MGHProgressMessage(progress, app, operationInfo)
             Dim h As Inventor.HoleFeature = existing(g.Key)
+            Dim ownedSketch As Inventor.PlanarSketch = Nothing
+            Try
+                ownedSketch = h.Sketch
+            Catch
+            End Try
+            operationInfo = "Recording group identity: " & g.Label
+            If MGHPersistIdentity(h, g, holes, plateDef, ownedSketch, namingWarnings) Then renamedGroups += 1
             Dim placement As Inventor.SketchHolePlacementDefinition = CType(h.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
             Dim sk As Inventor.PlanarSketch = h.Sketch
             Dim allPts As Inventor.ObjectCollection = app.TransientObjects.CreateObjectCollection()
@@ -583,7 +595,6 @@ Sub Main()
                     operationInfo = "Upgrading legacy clearance association: " & g.Label
                     MGHProgressMessage(progress, app, operationInfo)
                     MGHApplyClearanceInfo(holes, h, g)
-                    h.AttributeSets.Item("MGH_Generator").Item("GroupKey").Value = g.Key
                 End If
                 If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
                     flippedGroups += 1
@@ -594,7 +605,6 @@ Sub Main()
                 If Not h.IsClearanceHole Then
                     MGHApplyClearanceInfo(holes, h, g)
                 End If
-                h.AttributeSets.Item("MGH_Generator").Item("GroupKey").Value = g.Key
             End If
             MGHProgressTick(progress, app, "Existing group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & " checked: " & g.Label)
         Next
@@ -611,10 +621,9 @@ Sub Main()
         MGHProgressMessage(progress, app, operationInfo)
         For Each checkFeat As Inventor.HoleFeature In holes
             If checkFeat.AttributeSets.NameIsUsed("MGH_Generator") Then
-                Dim checkSet As Inventor.AttributeSet = checkFeat.AttributeSets.Item("MGH_Generator")
-                Dim checkKey As String = CStr(checkSet.Item("GroupKey").Value)
-                If desiredGroups.ContainsKey(checkKey) Then
-                    Dim requested As OutputGroup = desiredGroups(checkKey)
+                Dim checkIdentity As MGHParsedKey = MGHReadIdentity(checkFeat.AttributeSets.Item("MGH_Generator"))
+                If checkIdentity IsNot Nothing AndAlso desiredGroups.ContainsKey(checkIdentity.SpecKey) Then
+                    Dim requested As OutputGroup = desiredGroups(checkIdentity.SpecKey)
                     If requested.Seat="Countersink" Then MGHAssertCountersink(checkFeat,requested)
                 End If
             End If
@@ -633,6 +642,7 @@ Sub Main()
             "Finished editing " & plateDoc.DisplayName & vbCrLf & _
             "New groups/features: " & newGroups.ToString() & vbCrLf & _
             "Existing groups extended/repaired: " & updatedGroups.ToString() & vbCrLf & _
+            "Group names updated: " & renamedGroups.ToString() & vbCrLf & _
             "Groups whose cut direction was reversed: " & flippedGroups.ToString() & vbCrLf & _
             "New hole centers: " & newPoints.ToString() & vbCrLf & _
             "Duplicate centers skipped: " & skippedDuplicates.ToString() & vbCrLf & _
@@ -1066,9 +1076,333 @@ Public Class OutputGroup
     Public ClearanceStandard As String
     Public ClearanceFamily As String
     Public LegacyKey As String
+    Public PlaneId As String
     Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
 End Class
 
+' Parsed form of a feature's stored identity. SpecKey excludes the group name.
+Public Class MGHParsedKey
+    Public SpecKey As String
+    Public Label As String
+    Public Kind As String
+    Public SizeKey As String
+End Class
+
+Public Class MGHIndexedFeature
+    Public Feature As Inventor.HoleFeature
+    Public SpecKey As String
+    Public SizeKey As String
+    Public Label As String
+    Public Kind As String
+End Class
+
+Public Class MGHFeatureIndex
+    Public BySpec As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
+    Public ByV15Size As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
+    Public LabelBySpec As New System.Collections.Generic.Dictionary(Of String, String)(System.StringComparer.Ordinal)
+    Public LabelByV15 As New System.Collections.Generic.Dictionary(Of String, String)(System.StringComparer.Ordinal)
+    Public Items As New System.Collections.Generic.List(Of MGHIndexedFeature)()
+End Class
+
+Function MGHSizeKey(planeId As String, screw As String, fit As String, diameterText As String) As String
+    Return planeId & "|" & screw & "|" & fit & "|" & diameterText
+End Function
+
+Function MGHBuildSpecKey(planeId As String, screw As String, fit As String, diameterText As String, _
+    mode As String, seat As String, seatDiameterText As String, seatDepthText As String, seatAngleText As String, _
+    threadType As String, threadDesignation As String, threadClass As String, _
+    clearanceStandard As String, clearanceFamily As String) As String
+    Return MGHSizeKey(planeId, screw, fit, diameterText) & "|V17|" & _
+        mode.Trim().ToUpperInvariant() & "|" & seat.Trim().ToUpperInvariant() & "|" & _
+        seatDiameterText & "|" & seatDepthText & "|" & seatAngleText & "|" & _
+        threadType.Trim().ToUpperInvariant() & "|" & threadDesignation.Trim().ToUpperInvariant() & "|" & _
+        threadClass.Trim().ToUpperInvariant() & "|" & _
+        clearanceStandard.Trim().ToUpperInvariant() & "|" & clearanceFamily.Trim().ToUpperInvariant()
+End Function
+
+Function MGHSpecKeyFromBucket(planeId As String, b As InputBucket) As String
+    Return MGHBuildSpecKey(planeId, b.Screw, b.Fit, _
+        b.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture), _
+        b.Mode, b.Seat, _
+        b.SeatDiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture), _
+        b.SeatDepthIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture), _
+        b.SeatAngleDeg.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture), _
+        b.ThreadType, b.ThreadDesignation, b.ThreadClass, b.ClearanceStandard, b.ClearanceFamily)
+End Function
+
+Function MGHJoinFields(parts As String(), startIndex As Integer, endIndex As Integer) As String
+    Dim joined As New System.Text.StringBuilder()
+    Dim i As Integer
+    For i = startIndex To endIndex
+        If i > startIndex Then joined.Append("|"c)
+        joined.Append(parts(i))
+    Next
+    Return joined.ToString()
+End Function
+
+Function MGHIsStoredMode(token As String) As Boolean
+    Return token = "CLEARANCE" OrElse token = "THREADED" OrElse token = "CUSTOM/PRESS-FIT"
+End Function
+
+' V1.5 keys are plane|screw|fit|diameter|label.
+' V1.6 keys insert the label before a V16 token. V1.7 keys have no label; V17 is the fifth field.
+Function MGHParseStoredGroupKey(saved As String) As MGHParsedKey
+    Dim parsed As New MGHParsedKey()
+    parsed.Kind = "Unknown"
+    parsed.SpecKey = ""
+    parsed.Label = ""
+    parsed.SizeKey = ""
+    If saved Is Nothing Then Return parsed
+    Dim parts As String() = saved.Split("|"c)
+    If parts.Length < 4 Then Return parsed
+    parsed.SizeKey = MGHJoinFields(parts, 0, 3)
+    Dim marker As Integer = -1
+    Dim i As Integer
+    For i = 0 To parts.Length - 2
+        If (parts(i) = "V16" OrElse parts(i) = "V17") AndAlso MGHIsStoredMode(parts(i + 1)) Then marker = i
+    Next
+    If marker < 0 Then
+        parsed.Kind = "V15"
+        If parts.Length > 4 Then parsed.Label = MGHJoinFields(parts, 4, parts.Length - 1)
+        Return parsed
+    End If
+    parsed.Kind = If(parts(marker) = "V17" AndAlso marker = 4, "V17", "V16")
+    If marker > 4 Then parsed.Label = MGHJoinFields(parts, 4, marker - 1)
+    parsed.SpecKey = parsed.SizeKey & "|V17|" & MGHJoinFields(parts, marker + 1, parts.Length - 1)
+    Return parsed
+End Function
+
+Sub MGHRequireStorable(fieldName As String, value As String)
+    If value IsNot Nothing AndAlso value.Length > 255 Then
+        Throw New System.Exception(fieldName & " is " & value.Length.ToString() & _
+            " characters. Inventor stores each identity field in its own string attribute, which holds 255 characters. Shorten it before generating holes.")
+    End If
+End Sub
+
+Function MGHSpecConflictMessage(existingName As String, existingLabel As String, requestedLabel As String) As String
+    Dim shownExisting As String = existingLabel
+    If shownExisting Is Nothing OrElse shownExisting = "" Then shownExisting = "(unnamed)"
+    Dim shownRequested As String = requestedLabel
+    If shownRequested Is Nothing OrElse shownRequested = "" Then shownRequested = "(unnamed)"
+    Return "An existing grouped hole already uses one of these locations, and this specification will not edit that feature." & vbCrLf & _
+        "The group name is stored separately. A name-only change updates the existing feature." & vbCrLf & _
+        "Fit, diameter, seat, thread, and clearance changes are a different specification, so they are left on the existing feature." & vbCrLf & _
+        "Existing feature: " & existingName & vbCrLf & _
+        "Existing group name: " & shownExisting & vbCrLf & _
+        "Requested group name: " & shownRequested & vbCrLf & _
+        "No holes were created."
+End Function
+
+Function MGHGetAttr(aset As Inventor.AttributeSet, name As String) As String
+    If aset Is Nothing OrElse Not aset.NameIsUsed(name) Then Return ""
+    Dim raw As Object = aset.Item(name).Value
+    If raw Is Nothing Then Return ""
+    Return CStr(raw)
+End Function
+
+Sub MGHPutAttr(aset As Inventor.AttributeSet, name As String, value As String)
+    If value Is Nothing Then value = ""
+    MGHRequireStorable(name, value)
+    If aset.NameIsUsed(name) Then
+        aset.Item(name).Value = value
+    Else
+        aset.Add(name, Inventor.ValueTypeEnum.kStringType, value)
+    End If
+End Sub
+
+Function MGHReadIdentity(aset As Inventor.AttributeSet) As MGHParsedKey
+    If String.Equals(MGHGetAttr(aset, "Schema"), "V17", System.StringComparison.Ordinal) Then
+        Dim current As New MGHParsedKey()
+        current.Kind = "V17"
+        current.Label = MGHGetAttr(aset, "GroupLabel")
+        current.SizeKey = MGHSizeKey(MGHGetAttr(aset, "PlaneId"), MGHGetAttr(aset, "Screw"), _
+            MGHGetAttr(aset, "Fit"), MGHGetAttr(aset, "Diameter"))
+        current.SpecKey = MGHBuildSpecKey(MGHGetAttr(aset, "PlaneId"), MGHGetAttr(aset, "Screw"), _
+            MGHGetAttr(aset, "Fit"), MGHGetAttr(aset, "Diameter"), _
+            MGHGetAttr(aset, "Mode"), MGHGetAttr(aset, "Seat"), _
+            MGHGetAttr(aset, "SeatDiameter"), MGHGetAttr(aset, "SeatDepth"), MGHGetAttr(aset, "SeatAngle"), _
+            MGHGetAttr(aset, "ThreadType"), MGHGetAttr(aset, "ThreadDesignation"), MGHGetAttr(aset, "ThreadClass"), _
+            MGHGetAttr(aset, "ClearanceStandard"), MGHGetAttr(aset, "ClearanceFamily"))
+        Return current
+    End If
+    If aset.NameIsUsed("GroupKey") Then Return MGHParseStoredGroupKey(CStr(aset.Item("GroupKey").Value))
+    Return Nothing
+End Function
+
+Function MGHLoadFeatureIndex(def As Inventor.PartComponentDefinition) As MGHFeatureIndex
+    Dim index As New MGHFeatureIndex()
+    Dim holes As Inventor.HoleFeatures = def.Features.HoleFeatures
+    For Each feat As Inventor.HoleFeature In holes
+        Try
+            If Not feat.AttributeSets.NameIsUsed("MGH_Generator") Then Continue For
+            Dim parsed As MGHParsedKey = MGHReadIdentity(feat.AttributeSets.Item("MGH_Generator"))
+            If parsed Is Nothing OrElse parsed.Kind = "Unknown" Then Continue For
+            Dim item As New MGHIndexedFeature()
+            item.Feature = feat
+            item.Label = parsed.Label
+            item.Kind = parsed.Kind
+            item.SpecKey = parsed.SpecKey
+            item.SizeKey = parsed.SizeKey
+            index.Items.Add(item)
+            If parsed.Kind = "V15" Then
+                If parsed.SizeKey = "" Then Continue For
+                If index.ByV15Size.ContainsKey(parsed.SizeKey) Then
+                    Throw New System.Exception("Two existing holes share the same V1.5 clearance identity (" & _
+                        index.ByV15Size(parsed.SizeKey).Name & " and " & feat.Name & ").")
+                End If
+                index.ByV15Size.Add(parsed.SizeKey, feat)
+                index.LabelByV15.Add(parsed.SizeKey, parsed.Label)
+            Else
+                If parsed.SpecKey = "" Then Continue For
+                If index.BySpec.ContainsKey(parsed.SpecKey) Then
+                    Throw New System.Exception("Two existing grouped holes have the same specification (" & _
+                        index.BySpec(parsed.SpecKey).Name & " and " & feat.Name & "). The group name is not part of the identity, so only one can remain.")
+                End If
+                index.BySpec.Add(parsed.SpecKey, feat)
+                index.LabelBySpec.Add(parsed.SpecKey, parsed.Label)
+            End If
+        Catch ex As System.Exception
+            If ex.Message.StartsWith("Two existing") Then Throw
+        End Try
+    Next
+    Return index
+End Function
+
+Sub MGHApplyStoredLabels(buckets As System.Collections.Generic.SortedDictionary(Of String, InputBucket), _
+    def As Inventor.PartComponentDefinition, planeId As String)
+    Dim index As MGHFeatureIndex = MGHLoadFeatureIndex(def)
+    For Each b As InputBucket In buckets.Values
+        Dim spec As String = MGHSpecKeyFromBucket(planeId, b)
+        Dim sizeKey As String = MGHSizeKey(planeId, b.Screw, b.Fit, _
+            b.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture))
+        Dim stored As String = ""
+        If index.LabelBySpec.ContainsKey(spec) Then
+            stored = index.LabelBySpec(spec)
+        ElseIf b.Mode = "Clearance" AndAlso b.Seat = "None" AndAlso index.LabelByV15.ContainsKey(sizeKey) Then
+            stored = index.LabelByV15(sizeKey)
+        End If
+        If stored <> "" Then b.GroupLabel = stored
+    Next
+End Sub
+
+Function MGHFeatureModelCenters(feat As Inventor.HoleFeature) As System.Collections.Generic.List(Of Inventor.Point)
+    Dim result As New System.Collections.Generic.List(Of Inventor.Point)()
+    Try
+        Dim placement As Inventor.SketchHolePlacementDefinition = TryCast(feat.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
+        If placement Is Nothing OrElse feat.Sketch Is Nothing Then Return result
+        For Each sp As Inventor.SketchPoint In placement.HoleCenterPoints
+            result.Add(feat.Sketch.SketchToModelSpace(sp.Geometry))
+        Next
+    Catch
+    End Try
+    Return result
+End Function
+
+Function MGHSharesAnyCenter(feat As Inventor.HoleFeature, centers As System.Collections.Generic.List(Of Inventor.Point)) As Boolean
+    For Each existingCenter As Inventor.Point In MGHFeatureModelCenters(feat)
+        For Each requested As Inventor.Point In centers
+            If existingCenter.DistanceTo(requested) < 0.005 Then Return True
+        Next
+    Next
+    Return False
+End Function
+
+Function MGHDescribeExistingGroups(def As Inventor.PartComponentDefinition, _
+    groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup)) As System.Collections.Generic.List(Of String)
+    Dim notes As New System.Collections.Generic.List(Of String)()
+    Dim index As MGHFeatureIndex = MGHLoadFeatureIndex(def)
+    For Each g As OutputGroup In groups.Values
+        Dim matchFeat As Inventor.HoleFeature = Nothing
+        Dim storedLabel As String = ""
+        If index.BySpec.ContainsKey(g.Key) Then
+            matchFeat = index.BySpec(g.Key)
+            storedLabel = index.LabelBySpec(g.Key)
+        ElseIf g.Mode = "Clearance" AndAlso g.Seat = "None" AndAlso index.ByV15Size.ContainsKey(g.LegacyKey) Then
+            matchFeat = index.ByV15Size(g.LegacyKey)
+            storedLabel = index.LabelByV15(g.LegacyKey)
+        End If
+        If matchFeat IsNot Nothing Then
+            If storedLabel <> "" AndAlso Not String.Equals(storedLabel, g.Label, System.StringComparison.Ordinal) Then
+                notes.Add("""" & storedLabel & """ will be renamed to """ & g.Label & """ on " & matchFeat.Name & ".")
+            End If
+        Else
+            For Each item As MGHIndexedFeature In index.Items
+                If MGHSharesAnyCenter(item.Feature, g.Centers) Then
+                    Throw New System.Exception(MGHSpecConflictMessage(item.Feature.Name, item.Label, g.Label))
+                End If
+            Next
+        End If
+    Next
+    Return notes
+End Function
+
+Function MGHIdentitySet(h As Inventor.HoleFeature) As Inventor.AttributeSet
+    If h.AttributeSets.NameIsUsed("MGH_Generator") Then
+        Dim existingSet As Inventor.AttributeSet = h.AttributeSets.Item("MGH_Generator")
+        Dim copies As Boolean = False
+        Try
+            copies = existingSet.CopyWithOwner
+        Catch
+        End Try
+        If copies AndAlso String.Equals(MGHGetAttr(existingSet, "Schema"), "V17", System.StringComparison.Ordinal) Then
+            Return existingSet
+        End If
+        existingSet.Delete()
+    End If
+    Return h.AttributeSets.Add("MGH_Generator", True)
+End Function
+
+Sub MGHWriteIdentityFields(aset As Inventor.AttributeSet, g As OutputGroup)
+    MGHPutAttr(aset, "Schema", "V17")
+    MGHPutAttr(aset, "PlaneId", g.PlaneId)
+    MGHPutAttr(aset, "Screw", g.Screw)
+    MGHPutAttr(aset, "Fit", g.Fit)
+    MGHPutAttr(aset, "Diameter", g.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture))
+    MGHPutAttr(aset, "Mode", g.Mode.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "Seat", g.Seat.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "SeatDiameter", g.SeatDiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture))
+    MGHPutAttr(aset, "SeatDepth", g.SeatDepthIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture))
+    MGHPutAttr(aset, "SeatAngle", g.SeatAngleDeg.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture))
+    MGHPutAttr(aset, "ThreadType", g.ThreadType.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "ThreadDesignation", g.ThreadDesignation.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "ThreadClass", g.ThreadClass.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "ClearanceStandard", g.ClearanceStandard.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "ClearanceFamily", g.ClearanceFamily.Trim().ToUpperInvariant())
+    MGHPutAttr(aset, "GroupLabel", g.Label)
+    If aset.NameIsUsed("GroupKey") Then aset.Item("GroupKey").Delete()
+End Sub
+
+' Returns True when an existing feature's stored name changed.
+Function MGHPersistIdentity(h As Inventor.HoleFeature, g As OutputGroup, _
+    allHoles As Inventor.HoleFeatures, def As Inventor.PartComponentDefinition, _
+    sketch As Inventor.PlanarSketch, warnings As System.Collections.Generic.List(Of String)) As Boolean
+    Dim previousLabel As String = ""
+    If h.AttributeSets.NameIsUsed("MGH_Generator") Then
+        Dim previous As MGHParsedKey = MGHReadIdentity(h.AttributeSets.Item("MGH_Generator"))
+        If previous IsNot Nothing Then previousLabel = previous.Label
+    End If
+    Dim aset As Inventor.AttributeSet = MGHIdentitySet(h)
+    MGHWriteIdentityFields(aset, g)
+    Dim labelChanged As Boolean = previousLabel <> "" AndAlso _
+        Not String.Equals(previousLabel, g.Label, System.StringComparison.Ordinal)
+    If previousLabel = "" OrElse labelChanged Then
+        Dim specificationTag As String = If(g.Mode = "Threaded", g.ThreadDesignation, _
+            "D" & g.DiameterIn.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture))
+        Try
+            h.Name = UniqueHoleName(allHoles, "MGH - " & CleanName(g.Label) & " - " & specificationTag, h)
+        Catch renameEx As System.Exception
+            warnings.Add("Hole feature for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
+        End Try
+        If sketch IsNot Nothing Then
+            Try
+                sketch.Name = UniqueSketchName(def, "MGH Sketch - " & CleanName(g.Label) & " - " & specificationTag, sketch)
+            Catch renameEx As System.Exception
+                warnings.Add("Sketch for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
+            End Try
+        End If
+    End If
+    Return labelChanged
+End Function
 
 Function MGHDefaultThread(size As String) As String
     Select Case size
