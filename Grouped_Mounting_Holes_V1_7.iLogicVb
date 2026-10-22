@@ -17,8 +17,9 @@
 ' The nut side is either the hole rim you clicked or the plate face you selected first.
 ' A washer under the nut sits on that side. A washer under the screw sits on the other side.
 ' A nut sits on the nut side, outside the washer under the nut when that washer is placed.
-' The first time a nut is used, click the face that sits against the washer. That face is saved in the nut part's iProperties.
-' Screw length is the span from that rim to the plate face, plus the washers and the nut. The file prompt opens Hardware\<size>\Screws\<length>Lg.
+' The first time a nut or screw is used, click the face that sits against the washer. That face is saved on the part.
+' Before the screw file window, the rule shows the length under the head: rim-to-plate span, washers, and nut.
+' The file window then opens Hardware\<size>\Screws\<length>Lg.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -1516,6 +1517,31 @@ Function MGHFormatInches(inches As Double) As String
     Return inches.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)
 End Function
 
+' Shown before the screw file window. Lengths are inches under the head.
+Function MGHScrewLengthMessage(sizeName As String, gripIn As Double, screwWasherIn As Double, nutWasherIn As Double, nutIn As Double, _
+    folderName As String, tooShort As Boolean) As String
+    If gripIn < 0 Then gripIn = 0
+    If screwWasherIn < 0 Then screwWasherIn = 0
+    If nutWasherIn < 0 Then nutWasherIn = 0
+    If nutIn < 0 Then nutIn = 0
+    Dim required As Double = gripIn + screwWasherIn + nutWasherIn + nutIn
+    Dim text As String = "The " & sizeName & " screw must be at least " & MGHFormatInches(required) & " in under the head." & vbCrLf & vbCrLf & _
+        "Distance from the hole rim to the plate face: " & MGHFormatInches(gripIn) & " in" & vbCrLf
+    If screwWasherIn > 0 Then text &= "Washer under the screw: " & MGHFormatInches(screwWasherIn) & " in" & vbCrLf
+    If nutWasherIn > 0 Then text &= "Washer under the nut: " & MGHFormatInches(nutWasherIn) & " in" & vbCrLf
+    If nutIn > 0 Then text &= "Nut: " & MGHFormatInches(nutIn) & " in" & vbCrLf
+    text &= vbCrLf
+    If tooShort AndAlso folderName <> "" Then
+        text &= "No length folder is at least that long. The window will open " & folderName & ", the longest folder." & vbCrLf
+    ElseIf folderName <> "" Then
+        text &= "Click OK, then select a screw from " & folderName & "." & vbCrLf
+    Else
+        text &= "Click OK, then select a screw at least that long." & vbCrLf
+    End If
+    text &= "Click Cancel to skip the screw."
+    Return text
+End Function
+
 Function MGHPreferredRoleDirectory(library As String, size As String, role As String) As String
     Dim names() As String = MGHSizeFolderNames(size)
     If names.Length = 0 OrElse library Is Nothing OrElse library.Trim() = "" Then Return ""
@@ -1700,18 +1726,23 @@ End Function
 Function MGHCircularEdge(edge As Inventor.Edge, ByRef center As Inventor.Point, ByRef radius As Double) As Boolean
     center = Nothing
     radius = 0
-    Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
-    If circ IsNot Nothing Then
-        center = circ.Center
-        radius = circ.Radius
-        Return radius > 0
-    End If
-    Dim arc As Inventor.Arc3d = TryCast(edge.Geometry, Inventor.Arc3d)
-    If arc IsNot Nothing Then
-        center = arc.Center
-        radius = arc.Radius
-        Return radius > 0
-    End If
+    If edge Is Nothing Then Return False
+    Try
+        Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
+        If circ IsNot Nothing Then
+            center = circ.Center
+            radius = circ.Radius
+            Return radius > 0
+        End If
+        Dim arc As Inventor.Arc3d = TryCast(edge.Geometry, Inventor.Arc3d)
+        If arc IsNot Nothing Then
+            center = arc.Center
+            radius = arc.Radius
+            Return radius > 0
+        End If
+    Catch
+        Return False
+    End Try
     Return False
 End Function
 
@@ -2136,10 +2167,100 @@ Sub MGHSetBearingFromFace(model As MGHWasherModel, face As Inventor.Face, app As
     If haveEdge Then model.BearingEdge = bearingEdge
 End Sub
 
-' Asks once, in the assembly, and writes the face reference onto the nut part.
+' The clicked face is the underside of the screw head. The head extends away from the washer.
+Sub MGHSetScrewBearingFromFace(model As MGHWasherModel, face As Inventor.Face, app As Inventor.Application)
+    If model Is Nothing OrElse face Is Nothing Then Throw New System.Exception("the mounting face is missing")
+    Dim pl As Inventor.Plane = Nothing
+    Try
+        pl = TryCast(face.Geometry, Inventor.Plane)
+    Catch
+        pl = Nothing
+    End Try
+    If pl Is Nothing Then Throw New System.Exception("Click the flat underside of the screw head.")
+    Dim bestCenter As Inventor.Point = Nothing
+    Dim bestRadius As Double = 0
+    Dim bestEdge As Inventor.Edge = Nothing
+    Dim haveCircle As Boolean = False
+    Try
+        For Each e As Inventor.Edge In face.Edges
+            Dim edgeCenter As Inventor.Point = Nothing
+            Dim edgeRadius As Double = 0
+            If Not MGHCircularEdge(e, edgeCenter, edgeRadius) Then Continue For
+            If Not haveCircle OrElse edgeRadius < bestRadius Then
+                bestCenter = edgeCenter
+                bestRadius = edgeRadius
+                bestEdge = e
+                haveCircle = True
+            End If
+        Next
+    Catch
+    End Try
+    If haveCircle Then
+        model.BearingX = bestCenter.X
+        model.BearingY = bestCenter.Y
+        model.BearingZ = bestCenter.Z
+        model.InnerRadius = bestRadius
+        model.BearingEdge = bestEdge
+    Else
+        Dim sample As Inventor.Point = face.PointOnFace
+        model.BearingX = sample.X
+        model.BearingY = sample.Y
+        model.BearingZ = sample.Z
+        If model.InnerRadius <= 0 Then model.InnerRadius = 0.1
+    End If
+    Dim body As Inventor.SurfaceBody = face.SurfaceBody
+    Dim faceOut As Inventor.UnitVector = MGHFaceOutward(face, body, app)
+    model.AxisX = -faceOut.X
+    model.AxisY = -faceOut.Y
+    model.AxisZ = -faceOut.Z
+    Dim rx As Double, ry As Double, rz As Double
+    If System.Math.Abs(model.AxisX) < 0.9 Then
+        MGHCross(model.AxisX, model.AxisY, model.AxisZ, 1, 0, 0, rx, ry, rz)
+    Else
+        MGHCross(model.AxisX, model.AxisY, model.AxisZ, 0, 1, 0, rx, ry, rz)
+    End If
+    If MGHNormalize(rx, ry, rz) AndAlso body IsNot Nothing Then
+        Dim probe() As Double = { _
+            model.BearingX + model.AxisX * 0.04 + rx * (model.InnerRadius + 0.04), _
+            model.BearingY + model.AxisY * 0.04 + ry * (model.InnerRadius + 0.04), _
+            model.BearingZ + model.AxisZ * 0.04 + rz * (model.InnerRadius + 0.04)}
+        Try
+            If body.IsPointInside(probe, False) <> Inventor.ContainmentEnum.kInsideContainment Then
+                model.AxisX = faceOut.X
+                model.AxisY = faceOut.Y
+                model.AxisZ = faceOut.Z
+            End If
+        Catch
+        End Try
+    End If
+    Dim headThickness As Double = 0
+    Try
+        For Each otherFace As Inventor.Face In body.Faces
+            Try
+                Dim otherPlane As Inventor.Plane = TryCast(otherFace.Geometry, Inventor.Plane)
+                If otherPlane Is Nothing Then Continue For
+                If System.Math.Abs(otherPlane.Normal.X * model.AxisX + otherPlane.Normal.Y * model.AxisY + otherPlane.Normal.Z * model.AxisZ) < 0.95 Then Continue For
+                Dim otherPoint As Inventor.Point = otherFace.PointOnFace
+                Dim along As Double = (otherPoint.X - model.BearingX) * model.AxisX + (otherPoint.Y - model.BearingY) * model.AxisY + (otherPoint.Z - model.BearingZ) * model.AxisZ
+                If along > 0.02 AndAlso along < 2.0 AndAlso (headThickness = 0 OrElse along < headThickness) Then headThickness = along
+            Catch
+            End Try
+        Next
+    Catch
+    End Try
+    If headThickness < 0.02 Then headThickness = 0.2
+    model.Thickness = headThickness
+    model.MidX = model.BearingX + model.AxisX * model.Thickness / 2.0
+    model.MidY = model.BearingY + model.AxisY * model.Thickness / 2.0
+    model.MidZ = model.BearingZ + model.AxisZ * model.Thickness / 2.0
+End Sub
+
+' Asks once, in the assembly, and writes the face reference onto the hardware part.
+' hardwareKind is "nut" or "screw".
 Function MGHUseMountingFace(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
     model As MGHWasherModel, roleLabel As String, hint As Inventor.Point, _
-    notes As System.Collections.Generic.List(Of String)) As Boolean
+    notes As System.Collections.Generic.List(Of String), hardwareKind As String) As Boolean
+    Dim isScrew As Boolean = String.Equals(hardwareKind, "screw", System.StringComparison.OrdinalIgnoreCase)
     If model Is Nothing OrElse model.Part Is Nothing Then Return False
     Dim saved As Inventor.Face = Nothing
     Try
@@ -2149,7 +2270,11 @@ Function MGHUseMountingFace(app As Inventor.Application, asm As Inventor.Assembl
     End Try
     If saved IsNot Nothing Then
         Try
-            MGHSetBearingFromFace(model, saved, app)
+            If isScrew Then
+                MGHSetScrewBearingFromFace(model, saved, app)
+            Else
+                MGHSetBearingFromFace(model, saved, app)
+            End If
             Return True
         Catch
             saved = Nothing
@@ -2166,40 +2291,53 @@ Function MGHUseMountingFace(app As Inventor.Application, asm As Inventor.Assembl
         Catch
         End Try
         Try
-            tempOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "Click this nut")
+            tempOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, If(isScrew, "Click this screw", "Click this nut"))
         Catch
         End Try
-        System.Windows.Forms.MessageBox.Show( _
-            "A copy of the nut was added at the first hole. It is named """ & tempOcc.Name & """." & vbCrLf & vbCrLf & _
-            "Click the flat face that will sit against the washer." & vbCrLf & _
-            "On a nylon lock nut, click the smooth metal face. Do not click the nylon ring." & vbCrLf & vbCrLf & _
-            "That face is saved on the nut file and reused next time." & vbCrLf & _
-            "Click OK, then click the face. Cancel on the next window skips this nut.", _
-            "Which nut face touches the washer?")
+        Dim faceTitle As String = If(isScrew, "Which screw face touches the washer?", "Which nut face touches the washer?")
+        Dim faceIntro As String
+        Dim facePalette As String
+        If isScrew Then
+            faceIntro = "A copy of the screw was added at the first hole. It is named """ & tempOcc.Name & """." & vbCrLf & vbCrLf & _
+                "Click the flat face under the head. That face sits against the washer." & vbCrLf & _
+                "Do not click the top of the head or the tip of the screw." & vbCrLf & vbCrLf & _
+                "That face is saved on the screw file and reused next time." & vbCrLf & _
+                "Click OK, then click the face. Cancel on the next window skips this screw."
+            facePalette = "Click the underside of the screw head, the face against the washer. Cancel skips this screw."
+        Else
+            faceIntro = "A copy of the nut was added at the first hole. It is named """ & tempOcc.Name & """." & vbCrLf & vbCrLf & _
+                "Click the flat face that will sit against the washer." & vbCrLf & _
+                "On a nylon lock nut, click the smooth metal face. Do not click the nylon ring." & vbCrLf & vbCrLf & _
+                "That face is saved on the nut file and reused next time." & vbCrLf & _
+                "Click OK, then click the face. Cancel on the next window skips this nut."
+            facePalette = "Click the smooth metal face of the added nut. Do not click the nylon ring. Cancel skips this nut."
+        End If
+        System.Windows.Forms.MessageBox.Show(faceIntro, faceTitle)
         Dim pickedFace As Inventor.Face = Nothing
         Do
             Dim selector As New MGHInteractionSelector()
-            Dim gotFace As Boolean = selector.Run(app, Inventor.SelectionFilterEnum.kPartFacePlanarFilter, _
-                "Which nut face touches the washer?", _
-                "Click the smooth metal face of the added nut. Do not click the nylon ring. Cancel skips this nut.", _
-                True)
+            Dim gotFace As Boolean = selector.Run(app, Inventor.SelectionFilterEnum.kPartFacePlanarFilter, faceTitle, facePalette, True)
             If Not gotFace OrElse selector.Picked.Count = 0 Then Return False
             Dim proxy As Inventor.FaceProxy = TryCast(selector.Picked(0), Inventor.FaceProxy)
             If proxy Is Nothing OrElse proxy.ContainingOccurrence Is Nothing OrElse _
                 Not String.Equals(proxy.ContainingOccurrence.Name, tempOcc.Name, System.StringComparison.OrdinalIgnoreCase) Then
-                System.Windows.Forms.MessageBox.Show("Click a flat face on the nut named """ & tempOcc.Name & """. That is the nut that was just added.", "Which nut face touches the washer?")
+                System.Windows.Forms.MessageBox.Show("Click a flat face on the part named """ & tempOcc.Name & """. That is the part that was just added.", faceTitle)
                 Continue Do
             End If
             pickedFace = proxy.NativeObject
             If pickedFace Is Nothing Then
-                System.Windows.Forms.MessageBox.Show("That face could not be read from the nut part.", "Nut mounting face")
+                System.Windows.Forms.MessageBox.Show("That face could not be read from the part.", faceTitle)
                 Continue Do
             End If
             Try
-                MGHSetBearingFromFace(model, pickedFace, app)
+                If isScrew Then
+                    MGHSetScrewBearingFromFace(model, pickedFace, app)
+                Else
+                    MGHSetBearingFromFace(model, pickedFace, app)
+                End If
                 Exit Do
             Catch ex As System.Exception
-                System.Windows.Forms.MessageBox.Show(ex.Message, "Nut mounting face")
+                System.Windows.Forms.MessageBox.Show(ex.Message, faceTitle)
                 pickedFace = Nothing
             End Try
         Loop
@@ -2216,7 +2354,7 @@ Function MGHUseMountingFace(app As Inventor.Application, asm As Inventor.Assembl
             Try
                 tempOcc.Delete()
             Catch
-                If notes IsNot Nothing Then notes.Add("The temporary nut used to choose the mounting face could not be removed.")
+                If notes IsNot Nothing Then notes.Add("The temporary " & If(isScrew, "screw", "nut") & " used to choose the mounting face could not be removed.")
             End Try
         End If
     End Try
@@ -2965,132 +3103,89 @@ Function MGHReadScrew(app As Inventor.Application, path As String) As MGHWasherM
     Next
     If body Is Nothing Then Throw New System.Exception("The screw part has no solid body: " & System.IO.Path.GetFileName(path))
 
+    ' Thread faces often raise E_FAIL when their geometry is read. Skip those faces.
+    ' The mounting-face prompt replaces this estimate, so a partial read is enough to continue.
+    Dim model As New MGHWasherModel()
+    model.Part = part
+    model.FilePath = path
+    model.InnerRadius = 0.1
+    model.Thickness = 0.2
+    model.AxisX = 0
+    model.AxisY = 0
+    model.AxisZ = 1
     Dim axisPoint As Inventor.Point = Nothing
     Dim axisDir As Inventor.UnitVector = Nothing
     Dim shankRadius As Double = 0
     Dim shankLow As Double = 0
     Dim shankHigh As Double = 0
     Dim haveShank As Boolean = False
-    For Each f As Inventor.Face In body.Faces
-        Dim cyl As Inventor.Cylinder = TryCast(f.Geometry, Inventor.Cylinder)
-        If cyl Is Nothing Then Continue For
-        If cyl.Radius < 0.04 OrElse cyl.Radius > 1.5 Then Continue For
-        Dim lowT As Double = 0
-        Dim highT As Double = 0
-        Dim haveT As Boolean = False
-        For Each ed As Inventor.Edge In f.Edges
-            Dim samples As New System.Collections.Generic.List(Of Inventor.Point)()
+    Try
+        For Each f As Inventor.Face In body.Faces
             Try
-                If ed.StartVertex IsNot Nothing Then samples.Add(ed.StartVertex.Point)
-            Catch
-            End Try
-            Try
-                If ed.StopVertex IsNot Nothing Then samples.Add(ed.StopVertex.Point)
-            Catch
-            End Try
-            Dim edgeCenter As Inventor.Point = Nothing
-            Dim edgeRadius As Double = 0
-            If MGHCircularEdge(ed, edgeCenter, edgeRadius) Then samples.Add(edgeCenter)
-            For Each sample As Inventor.Point In samples
-                Dim t As Double = (sample.X - cyl.BasePoint.X) * cyl.AxisVector.X + (sample.Y - cyl.BasePoint.Y) * cyl.AxisVector.Y + (sample.Z - cyl.BasePoint.Z) * cyl.AxisVector.Z
-                If Not haveT Then
-                    lowT = t : highT = t : haveT = True
-                ElseIf t < lowT Then
-                    lowT = t
-                ElseIf t > highT Then
-                    highT = t
+                Dim cyl As Inventor.Cylinder = TryCast(f.Geometry, Inventor.Cylinder)
+                If cyl Is Nothing Then Continue For
+                If cyl.Radius < 0.04 OrElse cyl.Radius > 1.5 Then Continue For
+                Dim lowT As Double = 0
+                Dim highT As Double = 0
+                Dim haveT As Boolean = False
+                For Each ed As Inventor.Edge In f.Edges
+                    Try
+                        Dim samples As New System.Collections.Generic.List(Of Inventor.Point)()
+                        Try
+                            If ed.StartVertex IsNot Nothing Then samples.Add(ed.StartVertex.Point)
+                        Catch
+                        End Try
+                        Try
+                            If ed.StopVertex IsNot Nothing Then samples.Add(ed.StopVertex.Point)
+                        Catch
+                        End Try
+                        Dim edgeCenter As Inventor.Point = Nothing
+                        Dim edgeRadius As Double = 0
+                        If MGHCircularEdge(ed, edgeCenter, edgeRadius) Then samples.Add(edgeCenter)
+                        For Each sample As Inventor.Point In samples
+                            Dim t As Double = (sample.X - cyl.BasePoint.X) * cyl.AxisVector.X + (sample.Y - cyl.BasePoint.Y) * cyl.AxisVector.Y + (sample.Z - cyl.BasePoint.Z) * cyl.AxisVector.Z
+                            If Not haveT Then
+                                lowT = t : highT = t : haveT = True
+                            ElseIf t < lowT Then
+                                lowT = t
+                            ElseIf t > highT Then
+                                highT = t
+                            End If
+                        Next
+                    Catch
+                    End Try
+                Next
+                If Not haveT Then Continue For
+                Dim length As Double = highT - lowT
+                If Not haveShank OrElse length > (shankHigh - shankLow) + 0.001 OrElse _
+                    (System.Math.Abs(length - (shankHigh - shankLow)) <= 0.001 AndAlso cyl.Radius < shankRadius) Then
+                    haveShank = True
+                    axisPoint = cyl.BasePoint
+                    axisDir = cyl.AxisVector
+                    shankRadius = cyl.Radius
+                    shankLow = lowT
+                    shankHigh = highT
                 End If
-            Next
+            Catch
+            End Try
         Next
-        If Not haveT Then Continue For
-        Dim length As Double = highT - lowT
-        If Not haveShank OrElse length > (shankHigh - shankLow) + 0.001 OrElse _
-            (System.Math.Abs(length - (shankHigh - shankLow)) <= 0.001 AndAlso cyl.Radius < shankRadius) Then
-            haveShank = True
-            axisPoint = cyl.BasePoint
-            axisDir = cyl.AxisVector
-            shankRadius = cyl.Radius
-            shankLow = lowT
-            shankHigh = highT
-        End If
-    Next
-    If Not haveShank Then Throw New System.Exception("Could not find the shank of " & System.IO.Path.GetFileName(path) & ".")
-
-    Dim band As Double = System.Math.Max(0.05, (shankHigh - shankLow) * 0.25)
-    Dim lowRadial As Double = 0
-    Dim highRadial As Double = 0
-    For Each f As Inventor.Face In body.Faces
-        Dim sample As Inventor.Point = Nothing
-        Try
-            sample = f.PointOnFace
-        Catch
-            sample = Nothing
-        End Try
-        If sample Is Nothing Then Continue For
-        Dim t As Double = (sample.X - axisPoint.X) * axisDir.X + (sample.Y - axisPoint.Y) * axisDir.Y + (sample.Z - axisPoint.Z) * axisDir.Z
-        Dim radial As Double = MGHDistanceToAxis(sample.X, sample.Y, sample.Z, axisPoint.X, axisPoint.Y, axisPoint.Z, axisDir.X, axisDir.Y, axisDir.Z)
-        If t <= shankLow + band AndAlso radial > lowRadial Then lowRadial = radial
-        If t >= shankHigh - band AndAlso radial > highRadial Then highRadial = radial
-    Next
-    Dim headAtHigh As Boolean = highRadial >= lowRadial
-    Dim bearingT As Double = If(headAtHigh, shankHigh, shankLow)
-    Dim axisSign As Double = If(headAtHigh, 1.0, -1.0)
-    Dim headExtreme As Double = bearingT
-    For Each f As Inventor.Face In body.Faces
-        Dim pl As Inventor.Plane = TryCast(f.Geometry, Inventor.Plane)
-        If pl Is Nothing Then Continue For
-        If System.Math.Abs(pl.Normal.X * axisDir.X + pl.Normal.Y * axisDir.Y + pl.Normal.Z * axisDir.Z) < 0.95 Then Continue For
-        Dim sample As Inventor.Point = Nothing
-        Try
-            sample = f.PointOnFace
-        Catch
-            sample = Nothing
-        End Try
-        If sample Is Nothing Then Continue For
-        Dim t As Double = (sample.X - axisPoint.X) * axisDir.X + (sample.Y - axisPoint.Y) * axisDir.Y + (sample.Z - axisPoint.Z) * axisDir.Z
-        If headAtHigh Then
-            If t > headExtreme Then headExtreme = t
-        ElseIf t < headExtreme Then
-            headExtreme = t
-        End If
-    Next
-    Dim headThickness As Double = System.Math.Abs(headExtreme - bearingT)
-    If headThickness < 0.02 Then headThickness = 0.15
-
-    Dim bearingEdge As Inventor.Edge = Nothing
-    Dim bearingGap As Double = 0
-    Dim haveEdge As Boolean = False
-    For Each f As Inventor.Face In body.Faces
-        For Each e As Inventor.Edge In f.Edges
-            Dim edgeCenter As Inventor.Point = Nothing
-            Dim radius As Double = 0
-            If Not MGHCircularEdge(e, edgeCenter, radius) Then Continue For
-            If System.Math.Abs(radius - shankRadius) > System.Math.Max(0.05, shankRadius * 0.35) Then Continue For
-            Dim t As Double = (edgeCenter.X - axisPoint.X) * axisDir.X + (edgeCenter.Y - axisPoint.Y) * axisDir.Y + (edgeCenter.Z - axisPoint.Z) * axisDir.Z
-            Dim gap As Double = System.Math.Abs(t - bearingT)
-            If Not haveEdge OrElse gap < bearingGap Then
-                bearingEdge = e
-                bearingGap = gap
-                haveEdge = True
-            End If
-        Next
-    Next
-
-    Dim model As New MGHWasherModel()
-    model.Part = part
-    model.InnerRadius = shankRadius
-    model.Thickness = headThickness
-    model.BearingX = axisPoint.X + axisDir.X * bearingT
-    model.BearingY = axisPoint.Y + axisDir.Y * bearingT
-    model.BearingZ = axisPoint.Z + axisDir.Z * bearingT
-    model.AxisX = axisDir.X * axisSign
-    model.AxisY = axisDir.Y * axisSign
-    model.AxisZ = axisDir.Z * axisSign
+    Catch
+        haveShank = False
+    End Try
+    If haveShank AndAlso axisPoint IsNot Nothing AndAlso axisDir IsNot Nothing Then
+        model.InnerRadius = shankRadius
+        model.BearingX = axisPoint.X + axisDir.X * shankHigh
+        model.BearingY = axisPoint.Y + axisDir.Y * shankHigh
+        model.BearingZ = axisPoint.Z + axisDir.Z * shankHigh
+        model.AxisX = axisDir.X
+        model.AxisY = axisDir.Y
+        model.AxisZ = axisDir.Z
+        Dim span As Double = System.Math.Abs(shankHigh - shankLow)
+        If span > 0.02 Then model.Thickness = System.Math.Min(span, 0.5)
+    End If
     model.MidX = model.BearingX + model.AxisX * model.Thickness / 2.0
     model.MidY = model.BearingY + model.AxisY * model.Thickness / 2.0
     model.MidZ = model.BearingZ + model.AxisZ * model.Thickness / 2.0
-    model.BearingEdge = bearingEdge
-    model.FilePath = path
     Return model
 End Function
 
@@ -3168,18 +3263,18 @@ Function MGHMaxGripCm(app As Inventor.Application, _
 End Function
 
 Function MGHChooseScrewFile(app As Inventor.Application, library As String, sizeName As String, _
-    requiredInches As Double, notes As System.Collections.Generic.List(Of String)) As String
+    gripIn As Double, screwWasherIn As Double, nutWasherIn As Double, nutIn As Double, _
+    notes As System.Collections.Generic.List(Of String)) As String
+    Dim requiredInches As Double = gripIn + screwWasherIn + nutWasherIn + nutIn
+    If requiredInches < 0 Then requiredInches = 0
     Dim roleDir As String = MGHResolveRoleDirectory(library, sizeName, "Screws")
     Dim expected As String = MGHPreferredRoleDirectory(library, sizeName, "Screws")
     Dim startDir As String = roleDir
+    Dim folderLabel As String = ""
+    Dim tooShort As Boolean = False
     If startDir = "" Then
-        System.Windows.Forms.MessageBox.Show( _
-            "No Screws folder was found for " & sizeName & "." & vbCrLf & _
-            "Expected: " & expected & vbCrLf & _
-            "The screw needs to be at least " & MGHFormatInches(requiredInches) & " in under the head." & vbCrLf & _
-            "The file window will open at the hardware folder so you can browse to the part.", _
-            "Grouped Mounting Holes")
         startDir = library
+        notes.Add("No Screws folder was found for " & sizeName & ". Expected: " & expected)
     Else
         Dim folderNames As New System.Collections.Generic.List(Of String)()
         Try
@@ -3188,17 +3283,24 @@ Function MGHChooseScrewFile(app As Inventor.Application, library As String, size
             Next
         Catch
         End Try
-        Dim tooShort As Boolean = False
         Dim best As String = MGHBestLengthFolder(folderNames.ToArray(), requiredInches, tooShort)
         If best <> "" Then
             Dim lengthDir As String = System.IO.Path.Combine(startDir, best)
-            If System.IO.Directory.Exists(lengthDir) Then startDir = lengthDir
+            If System.IO.Directory.Exists(lengthDir) Then
+                startDir = lengthDir
+                folderLabel = best
+            End If
         End If
         If tooShort Then
             notes.Add(sizeName & " needs a screw at least " & MGHFormatInches(requiredInches) & " in, which is longer than the longest " & best & " folder.")
         Else
             notes.Add(sizeName & " screw length needed: " & MGHFormatInches(requiredInches) & " in.")
         End If
+    End If
+    Dim lengthText As String = MGHScrewLengthMessage(sizeName, gripIn, screwWasherIn, nutWasherIn, nutIn, folderLabel, tooShort)
+    If System.Windows.Forms.MessageBox.Show(lengthText, "Screw length", System.Windows.Forms.MessageBoxButtons.OKCancel) <> System.Windows.Forms.DialogResult.OK Then
+        notes.Add(sizeName & " screw was skipped.")
+        Return ""
     End If
     Dim picked As String = MGHPickPartFile(app, "Select the " & sizeName & " screw, at least " & MGHFormatInches(requiredInches) & " in — " & startDir, startDir)
     If picked = "" Then
@@ -3306,7 +3408,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             stepName = "Reading the nut"
             Dim nutModel As MGHWasherModel = MGHReadWasher(app, chosenNuts(sizeName))
             stepName = "Choosing the nut mounting face"
-            If Not MGHUseMountingFace(app, asm, nutModel, sizeName & " nut", faceHint, notes) Then
+            If Not MGHUseMountingFace(app, asm, nutModel, sizeName & " nut", faceHint, notes, "nut") Then
                 notes.Add(sizeName & " nut was skipped because its mounting face was not selected.")
                 chosenNuts.Remove(sizeName)
             Else
@@ -3321,13 +3423,8 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     If placeScrew Then
         stepName = "Choosing a screw"
         For Each sizeName As String In sizes
-            Dim washerCount As Integer = 0
             Dim washerCm As Double = 0
-            If washerModels.ContainsKey(sizeName) Then
-                washerCm = washerModels(sizeName).Thickness
-                If placeUnderScrew Then washerCount += 1
-                If placeUnderNut Then washerCount += 1
-            End If
+            If washerModels.ContainsKey(sizeName) Then washerCm = washerModels(sizeName).Thickness
             Dim nutCount As Integer = 0
             Dim nutCm As Double = 0
             If placeNut AndAlso nutModels.ContainsKey(sizeName) Then
@@ -3339,8 +3436,16 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                 gripCm = 0
                 notes.Add(sizeName & " screw length does not include the parts, because the hole rim was not recorded.")
             End If
-            Dim requiredInches As Double = MGHStackLengthInches(gripCm, washerCm, washerCount, nutCm, nutCount)
-            Dim screwFile As String = MGHChooseScrewFile(app, library, sizeName, requiredInches, notes)
+            Dim gripIn As Double = gripCm / 2.54
+            Dim screwWasherIn As Double = 0
+            Dim nutWasherIn As Double = 0
+            If washerCm > 0 Then
+                If placeUnderScrew Then screwWasherIn = washerCm / 2.54
+                If placeUnderNut Then nutWasherIn = washerCm / 2.54
+            End If
+            Dim nutIn As Double = 0
+            If nutCount > 0 Then nutIn = nutCm / 2.54
+            Dim screwFile As String = MGHChooseScrewFile(app, library, sizeName, gripIn, screwWasherIn, nutWasherIn, nutIn, notes)
             If screwFile <> "" Then chosenScrews.Add(sizeName, screwFile)
         Next
     End If
@@ -3348,9 +3453,17 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     stepName = "Reading the screw"
     For Each sizeName As String In New System.Collections.Generic.List(Of String)(chosenScrews.Keys)
         Try
-            screwModels.Add(sizeName, MGHReadScrew(app, chosenScrews(sizeName)))
+            stepName = "Opening the screw"
+            Dim screwModel As MGHWasherModel = MGHReadScrew(app, chosenScrews(sizeName))
+            stepName = "Choosing the screw mounting face"
+            If Not MGHUseMountingFace(app, asm, screwModel, sizeName & " screw", faceHint, notes, "screw") Then
+                notes.Add(sizeName & " screw was skipped because its mounting face was not selected.")
+                chosenScrews.Remove(sizeName)
+            Else
+                screwModels.Add(sizeName, screwModel)
+            End If
         Catch ex As System.Exception
-            notes.Add(sizeName & " screw was not placed (" & ex.Message & ").")
+            notes.Add(sizeName & " screw was not placed while " & stepName & ": " & ex.Message)
             chosenScrews.Remove(sizeName)
         End Try
     Next
