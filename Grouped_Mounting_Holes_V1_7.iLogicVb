@@ -13,6 +13,8 @@
 ' Group identity is the size, thread, seat, and clearance specification. The group name is not part of it.
 ' A name change updates the existing feature. A specification change does not, and the rule explains why before cutting.
 ' Each identity field is its own attribute (Inventor string attributes hold 255 characters). The set is copied with the feature.
+' After the holes succeed, the rule can place washers from the hardware library.
+' The file prompt opens Hardware\<size>\Washers (for example Hardware\#8\Washers). Nuts and screws are not placed yet.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -342,6 +344,7 @@ Sub Main()
         preview.AppendLine("Native standard clearance and thread dimensions come from Inventor's local tables.")
         preview.AppendLine("This modifies the REAL plate .ipt and every assembly occurrence of it.")
         preview.AppendLine("The script does NOT save the part automatically. Make a backup first.")
+        preview.AppendLine("After the holes succeed, you can place a washer on each hole. Skip that step to leave the assembly unchanged.")
         If excluded.Count > 0 Then
             preview.AppendLine()
             preview.AppendLine(excluded.Count.ToString() & " selections were skipped:")
@@ -638,6 +641,12 @@ Sub Main()
             progress.Close()
             progress = Nothing
         End If
+        Dim washerSummary As String = ""
+        Try
+            washerSummary = MGHPlaceWashers(app, aDoc, plateOcc, plateDef, plateNativeFace, desiredGroups)
+        Catch washerEx As System.Exception
+            washerSummary = "Washers were not placed." & vbCrLf & washerEx.Message
+        End Try
         System.Windows.Forms.MessageBox.Show( _
             "Finished editing " & plateDoc.DisplayName & vbCrLf & _
             "New groups/features: " & newGroups.ToString() & vbCrLf & _
@@ -648,6 +657,7 @@ Sub Main()
             "Duplicate centers skipped: " & skippedDuplicates.ToString() & vbCrLf & _
             If(namingWarnings.Count = 0, "", vbCrLf & "Naming notes (geometry was created):" & vbCrLf & _
                 String.Join(vbCrLf, namingWarnings.ToArray()) & vbCrLf) & vbCrLf & _
+            washerSummary & vbCrLf & vbCrLf & _
             "Inspect the plate, dimensions, and hardware clearances, then SAVE the plate .ipt and assembly.", _
             "Grouped Mounting Holes")
     Catch ex As System.Exception
@@ -1034,6 +1044,87 @@ Public Class MGHGenerateDialog
     End Sub
 End Class
 
+' One choice for the whole run: which plate face the washers sit on.
+' The library path is remembered on the assembly after a face is chosen.
+Public Class MGHWasherSideDialog
+    Inherits System.Windows.Forms.Form
+    Private libraryBox As System.Windows.Forms.TextBox
+    Public OnSelectedFace As Boolean
+    Public LibraryPath As String
+
+    Public Sub New(initialLibrary As String)
+        MyBase.New()
+        Me.Text = "Place washers?"
+        Me.Width = 640 : Me.Height = 300
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.MaximizeBox = False : Me.MinimizeBox = False
+        Dim note As New System.Windows.Forms.Label()
+        note.Left = 14 : note.Top = 12 : note.Width = 600 : note.Height = 72
+        note.Text = "Washers are placed at every hole in this run, one part per fastener size." & vbCrLf & _
+            "The next window opens that size's Washers folder so you can pick the .ipt." & vbCrLf & _
+            "Opposite face is the nut side. Selected face is the face you clicked on the plate."
+        Me.Controls.Add(note)
+        Dim libraryLabel As New System.Windows.Forms.Label()
+        libraryLabel.Left = 14 : libraryLabel.Top = 92 : libraryLabel.Width = 90 : libraryLabel.Height = 22
+        libraryLabel.Text = "Library"
+        Me.Controls.Add(libraryLabel)
+        libraryBox = New System.Windows.Forms.TextBox()
+        libraryBox.Left = 104 : libraryBox.Top = 90 : libraryBox.Width = 500 : libraryBox.Height = 22
+        libraryBox.ReadOnly = True
+        libraryBox.Text = initialLibrary
+        Me.Controls.Add(libraryBox)
+
+        Dim oppositeBtn As New System.Windows.Forms.Button()
+        oppositeBtn.Text = "Opposite Face (Nut Side)"
+        oppositeBtn.Left = 14 : oppositeBtn.Top = 132 : oppositeBtn.Width = 290 : oppositeBtn.Height = 40
+        AddHandler oppositeBtn.Click, AddressOf ChooseOpposite
+        Me.Controls.Add(oppositeBtn)
+        Dim selectedBtn As New System.Windows.Forms.Button()
+        selectedBtn.Text = "Selected Face"
+        selectedBtn.Left = 316 : selectedBtn.Top = 132 : selectedBtn.Width = 288 : selectedBtn.Height = 40
+        AddHandler selectedBtn.Click, AddressOf ChooseSelected
+        Me.Controls.Add(selectedBtn)
+        Dim changeBtn As New System.Windows.Forms.Button()
+        changeBtn.Text = "Change Hardware Folder"
+        changeBtn.Left = 14 : changeBtn.Top = 188 : changeBtn.Width = 200 : changeBtn.Height = 32
+        AddHandler changeBtn.Click, AddressOf ChangeLibrary
+        Me.Controls.Add(changeBtn)
+        Dim skipBtn As New System.Windows.Forms.Button()
+        skipBtn.Text = "Skip Washers"
+        skipBtn.Left = 474 : skipBtn.Top = 188 : skipBtn.Width = 130 : skipBtn.Height = 32
+        AddHandler skipBtn.Click, AddressOf SkipWashers
+        Me.Controls.Add(skipBtn)
+    End Sub
+
+    Private Sub ChooseOpposite(sender As Object, e As System.EventArgs)
+        LibraryPath = libraryBox.Text.Trim()
+        OnSelectedFace = False
+        Me.DialogResult = System.Windows.Forms.DialogResult.OK
+        Me.Close()
+    End Sub
+    Private Sub ChooseSelected(sender As Object, e As System.EventArgs)
+        LibraryPath = libraryBox.Text.Trim()
+        OnSelectedFace = True
+        Me.DialogResult = System.Windows.Forms.DialogResult.OK
+        Me.Close()
+    End Sub
+    Private Sub ChangeLibrary(sender As Object, e As System.EventArgs)
+        Dim browser As New System.Windows.Forms.FolderBrowserDialog()
+        browser.Description = "Select the hardware folder. Each size folder, such as #8, should contain a Washers folder."
+        browser.ShowNewFolderButton = False
+        If System.IO.Directory.Exists(libraryBox.Text) Then browser.SelectedPath = libraryBox.Text
+        If browser.ShowDialog() = System.Windows.Forms.DialogResult.OK AndAlso browser.SelectedPath <> "" Then
+            libraryBox.Text = browser.SelectedPath
+        End If
+        browser.Dispose()
+    End Sub
+    Private Sub SkipWashers(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
+        Me.Close()
+    End Sub
+End Class
+
 Public Class MountPoint
     Public Center As Inventor.Point
     Public SourceDiameterIn As Double
@@ -1403,6 +1494,787 @@ Function MGHPersistIdentity(h As Inventor.HoleFeature, g As OutputGroup, _
     End If
     Return labelChanged
 End Function
+
+Function MGHDefaultHardwareLibrary() As String
+    Return "C:\Users\dblack\Desktop\ODINN\Design Activity\Hardware"
+End Function
+
+' Folder names under the hardware library. A size such as 1/4 cannot be a Windows
+' folder name, so the hyphenated form is tried first.
+Function MGHSizeFolderNames(size As String) As String()
+    Dim names As New System.Collections.Generic.List(Of String)()
+    If size Is Nothing Then Return names.ToArray()
+    Dim trimmed As String = size.Trim()
+    If trimmed = "" OrElse String.Equals(trimmed, "Custom", System.StringComparison.OrdinalIgnoreCase) Then
+        Return names.ToArray()
+    End If
+    If trimmed.IndexOf("/"c) >= 0 OrElse trimmed.IndexOf("\"c) >= 0 Then
+        names.Add(trimmed.Replace("/"c, "-"c).Replace("\"c, "-"c))
+        names.Add(trimmed.Replace("/"c, "_"c).Replace("\"c, "_"c))
+        Dim slash As Integer = trimmed.IndexOf("/"c)
+        If slash < 0 Then slash = trimmed.IndexOf("\"c)
+        Dim numerator As Double = 0
+        Dim denominator As Double = 0
+        If slash > 0 AndAlso slash < trimmed.Length - 1 AndAlso _
+           Double.TryParse(trimmed.Substring(0, slash), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, numerator) AndAlso _
+           Double.TryParse(trimmed.Substring(slash + 1), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, denominator) AndAlso _
+           denominator <> 0 Then
+            names.Add((numerator / denominator).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture))
+        End If
+    Else
+        names.Add(trimmed)
+    End If
+    Return names.ToArray()
+End Function
+
+Function MGHPreferredRoleDirectory(library As String, size As String, role As String) As String
+    Dim names() As String = MGHSizeFolderNames(size)
+    If names.Length = 0 OrElse library Is Nothing OrElse library.Trim() = "" Then Return ""
+    Return System.IO.Path.Combine(library.Trim(), names(0), role)
+End Function
+
+' The first candidate directory that already exists, or empty when none do.
+Function MGHResolveRoleDirectory(library As String, size As String, role As String) As String
+    If library Is Nothing OrElse library.Trim() = "" Then Return ""
+    Dim root As String = library.Trim()
+    Dim names() As String = MGHSizeFolderNames(size)
+    Dim i As Integer
+    For i = 0 To names.Length - 1
+        Dim candidate As String = System.IO.Path.Combine(root, names(i), role)
+        If System.IO.Directory.Exists(candidate) Then Return candidate
+    Next
+    Return ""
+End Function
+
+' True when the higher end along the washer axis is the face that sits on the plate.
+' A toothed end has many more faces and is seated against the plate. When the two
+' ends match, either face is acceptable and the broader flat face is used.
+Function MGHWasherBearingIsHighEnd(lowFaces As Integer, highFaces As Integer, lowArea As Double, highArea As Double) As Boolean
+    Dim lowToothed As Boolean = lowFaces >= highFaces * 2 AndAlso lowFaces >= highFaces + 4
+    Dim highToothed As Boolean = highFaces >= lowFaces * 2 AndAlso highFaces >= lowFaces + 4
+    If highToothed AndAlso Not lowToothed Then Return True
+    If lowToothed AndAlso Not highToothed Then Return False
+    If highArea > lowArea + 0.0000001 Then Return True
+    Return False
+End Function
+
+Sub MGHCross(ax As Double, ay As Double, az As Double, bx As Double, by As Double, bz As Double, _
+    ByRef cx As Double, ByRef cy As Double, ByRef cz As Double)
+    cx = ay * bz - az * by
+    cy = az * bx - ax * bz
+    cz = ax * by - ay * bx
+End Sub
+
+Function MGHNormalize(ByRef x As Double, ByRef y As Double, ByRef z As Double) As Boolean
+    Dim mag As Double = System.Math.Sqrt(x * x + y * y + z * z)
+    If mag < 0.000000001 Then Return False
+    x /= mag : y /= mag : z /= mag
+    Return True
+End Function
+
+' Right-handed X and Y for a unit Z axis. Spin around Z is fixed so a re-run lands the same way.
+Sub MGHWasherBasis(zx As Double, zy As Double, zz As Double, _
+    ByRef xx As Double, ByRef xy As Double, ByRef xz As Double, _
+    ByRef yx As Double, ByRef yy As Double, ByRef yz As Double)
+    Dim rx As Double, ry As Double, rz As Double
+    If System.Math.Abs(zx) < 0.9 Then
+        rx = 1 : ry = 0 : rz = 0
+    Else
+        rx = 0 : ry = 1 : rz = 0
+    End If
+    MGHCross(zx, zy, zz, rx, ry, rz, xx, xy, xz)
+    If Not MGHNormalize(xx, xy, xz) Then Throw New System.Exception("Could not build a washer axis.")
+    MGHCross(zx, zy, zz, xx, xy, xz, yx, yy, yz)
+    If Not MGHNormalize(yx, yy, yz) Then Throw New System.Exception("Could not build a washer axis.")
+End Sub
+
+' Maps a part-space point into the assembly. The bearing point lands on the contact
+' point, and the washer axis (from the plate face through the washer) follows the outward normal.
+Sub MGHMapWasherPoint(bX As Double, bY As Double, bZ As Double, aX As Double, aY As Double, aZ As Double, _
+    cX As Double, cY As Double, cZ As Double, nX As Double, nY As Double, nZ As Double, _
+    pX As Double, pY As Double, pZ As Double, ByRef oX As Double, ByRef oY As Double, ByRef oZ As Double)
+    Dim fxx As Double, fxy As Double, fxz As Double, fyx As Double, fyy As Double, fyz As Double
+    Dim txx As Double, txy As Double, txz As Double, tyx As Double, tyy As Double, tyz As Double
+    MGHWasherBasis(aX, aY, aZ, fxx, fxy, fxz, fyx, fyy, fyz)
+    MGHWasherBasis(nX, nY, nZ, txx, txy, txz, tyx, tyy, tyz)
+    Dim dx As Double = pX - bX
+    Dim dy As Double = pY - bY
+    Dim dz As Double = pZ - bZ
+    Dim alongX As Double = dx * fxx + dy * fxy + dz * fxz
+    Dim alongY As Double = dx * fyx + dy * fyy + dz * fyz
+    Dim alongZ As Double = dx * aX + dy * aY + dz * aZ
+    oX = cX + alongX * txx + alongY * tyx + alongZ * nX
+    oY = cY + alongX * txy + alongY * tyy + alongZ * nY
+    oZ = cZ + alongX * txz + alongY * tyz + alongZ * nZ
+End Sub
+
+Public Class MGHWasherModel
+    Public BearingX As Double
+    Public BearingY As Double
+    Public BearingZ As Double
+    Public AxisX As Double
+    Public AxisY As Double
+    Public AxisZ As Double
+    Public MidX As Double
+    Public MidY As Double
+    Public MidZ As Double
+    Public Thickness As Double
+    Public InnerRadius As Double
+    Public BearingEdge As Inventor.Edge
+    Public Part As Inventor.PartDocument
+End Class
+
+Function MGHReadHardwareLibrary(doc As Inventor.Document) As String
+    Try
+        If doc Is Nothing OrElse Not doc.AttributeSets.NameIsUsed("MGH_Settings") Then Return ""
+        Return MGHGetAttr(doc.AttributeSets.Item("MGH_Settings"), "HardwareLibrary")
+    Catch
+        Return ""
+    End Try
+End Function
+
+Sub MGHWriteHardwareLibrary(doc As Inventor.Document, path As String)
+    If doc Is Nothing OrElse path Is Nothing Then Return
+    If path.Length = 0 OrElse path.Length > 255 Then Return
+    Dim aset As Inventor.AttributeSet
+    If doc.AttributeSets.NameIsUsed("MGH_Settings") Then
+        aset = doc.AttributeSets.Item("MGH_Settings")
+    Else
+        aset = doc.AttributeSets.Add("MGH_Settings", True)
+    End If
+    MGHPutAttr(aset, "HardwareLibrary", path)
+End Sub
+
+Function MGHPickPartFile(app As Inventor.Application, title As String, initialDirectory As String) As String
+    Dim dialog As Inventor.FileDialog = Nothing
+    app.CreateFileDialog(dialog)
+    dialog.Filter = "Inventor Parts (*.ipt)|*.ipt"
+    dialog.FilterIndex = 1
+    dialog.DialogTitle = title
+    dialog.CancelError = True
+    dialog.InsertMode = False
+    dialog.OptionsEnabled = False
+    dialog.MultiSelectEnabled = False
+    If initialDirectory <> "" AndAlso System.IO.Directory.Exists(initialDirectory) Then
+        dialog.InitialDirectory = initialDirectory
+    End If
+    Try
+        dialog.ShowOpen()
+    Catch
+        Return ""
+    End Try
+    If dialog.FileName Is Nothing Then Return ""
+    Return dialog.FileName.Trim()
+End Function
+
+Function MGHBrowseHardwareLibrary(currentPath As String) As String
+    Dim browser As New System.Windows.Forms.FolderBrowserDialog()
+    browser.Description = "Select the hardware folder. Each size folder, such as #8, should contain a Washers folder."
+    browser.ShowNewFolderButton = False
+    If currentPath <> "" AndAlso System.IO.Directory.Exists(currentPath) Then browser.SelectedPath = currentPath
+    Dim chosen As String = ""
+    If browser.ShowDialog() = System.Windows.Forms.DialogResult.OK Then chosen = browser.SelectedPath
+    browser.Dispose()
+    Return chosen
+End Function
+
+Function MGHCircularEdge(edge As Inventor.Edge, ByRef center As Inventor.Point, ByRef radius As Double) As Boolean
+    center = Nothing
+    radius = 0
+    Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
+    If circ IsNot Nothing Then
+        center = circ.Center
+        radius = circ.Radius
+        Return radius > 0
+    End If
+    Dim arc As Inventor.Arc3d = TryCast(edge.Geometry, Inventor.Arc3d)
+    If arc IsNot Nothing Then
+        center = arc.Center
+        radius = arc.Radius
+        Return radius > 0
+    End If
+    Return False
+End Function
+
+Function MGHDistanceToAxis(px As Double, py As Double, pz As Double, ax As Double, ay As Double, az As Double, _
+    dx As Double, dy As Double, dz As Double) As Double
+    Dim vx As Double = px - ax
+    Dim vy As Double = py - ay
+    Dim vz As Double = pz - az
+    Dim cx As Double, cy As Double, cz As Double
+    MGHCross(vx, vy, vz, dx, dy, dz, cx, cy, cz)
+    Return System.Math.Sqrt(cx * cx + cy * cy + cz * cz)
+End Function
+
+' Outward unit vector of a planar face, pointing out of the solid.
+Function MGHFaceOutward(face As Inventor.Face, body As Inventor.SurfaceBody, app As Inventor.Application) As Inventor.UnitVector
+    Dim pl As Inventor.Plane = TryCast(face.Geometry, Inventor.Plane)
+    If pl Is Nothing OrElse body Is Nothing Then Throw New System.Exception("The selected plate face is no longer planar.")
+    Dim n As Inventor.UnitVector = pl.Normal
+    Dim p As Inventor.Point = face.PointOnFace
+    Dim offset As Double = 0.02
+    Dim plus() As Double = {p.X + n.X * offset, p.Y + n.Y * offset, p.Z + n.Z * offset}
+    Dim minus() As Double = {p.X - n.X * offset, p.Y - n.Y * offset, p.Z - n.Z * offset}
+    Dim plusInside As Boolean = (body.IsPointInside(plus, False) = Inventor.ContainmentEnum.kInsideContainment)
+    Dim minusInside As Boolean = (body.IsPointInside(minus, False) = Inventor.ContainmentEnum.kInsideContainment)
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    If minusInside AndAlso Not plusInside Then Return n
+    If plusInside AndAlso Not minusInside Then Return tg.CreateUnitVector(-n.X, -n.Y, -n.Z)
+    If face.IsParamReversed Then Return tg.CreateUnitVector(-n.X, -n.Y, -n.Z)
+    Return n
+End Function
+
+' Circular rim of the hole at this center. The selected face uses the rim on the clicked
+' face. The opposite face uses the rim farthest through the plate.
+Function MGHFindHoleRim(def As Inventor.PartComponentDefinition, center As Inventor.Point, _
+    outward As Inventor.UnitVector, onSelectedFace As Boolean) As Inventor.Edge
+    Dim best As Inventor.Edge = Nothing
+    Dim bestAlong As Double = 0
+    Dim have As Boolean = False
+    For Each hf As Inventor.HoleFeature In def.Features.HoleFeatures
+        Dim created As Inventor.Faces = Nothing
+        Try
+            created = hf.Faces
+        Catch
+            created = Nothing
+        End Try
+        If created Is Nothing Then Continue For
+        For Each f As Inventor.Face In created
+            For Each e As Inventor.Edge In f.Edges
+                Dim edgeCenter As Inventor.Point = Nothing
+                Dim radius As Double = 0
+                If Not MGHCircularEdge(e, edgeCenter, radius) Then Continue For
+                If radius < 0.02 Then Continue For
+                Dim radial As Double = MGHDistanceToAxis(edgeCenter.X, edgeCenter.Y, edgeCenter.Z, _
+                    center.X, center.Y, center.Z, outward.X, outward.Y, outward.Z)
+                If radial > 0.05 Then Continue For
+                Dim along As Double = (edgeCenter.X - center.X) * outward.X + _
+                    (edgeCenter.Y - center.Y) * outward.Y + (edgeCenter.Z - center.Z) * outward.Z
+                Dim take As Boolean = False
+                If Not have Then
+                    take = True
+                ElseIf onSelectedFace Then
+                    If System.Math.Abs(along) < System.Math.Abs(bestAlong) - 0.0000001 Then take = True
+                ElseIf along < bestAlong - 0.0000001 Then
+                    take = True
+                End If
+                If take Then
+                    best = e
+                    bestAlong = along
+                    have = True
+                End If
+            Next
+        Next
+    Next
+    Return best
+End Function
+
+Function MGHReadWasher(app As Inventor.Application, path As String) As MGHWasherModel
+    Dim opened As Inventor.Document = app.Documents.Open(path, False)
+    Dim part As Inventor.PartDocument = TryCast(opened, Inventor.PartDocument)
+    If part Is Nothing Then Throw New System.Exception("The selected file is not an Inventor part: " & path)
+    Dim body As Inventor.SurfaceBody = Nothing
+    Dim bestVolume As Double = -1
+    For Each candidate As Inventor.SurfaceBody In part.ComponentDefinition.SurfaceBodies
+        If Not candidate.IsSolid Then Continue For
+        Dim volume As Double = 0
+        Try
+            volume = candidate.Volume(1.0)
+        Catch
+            volume = 0
+        End Try
+        If body Is Nothing OrElse volume > bestVolume Then
+            body = candidate
+            bestVolume = volume
+        End If
+    Next
+    If body Is Nothing Then Throw New System.Exception("The washer part has no solid body: " & System.IO.Path.GetFileName(path))
+
+    Dim holeFace As Inventor.Face = Nothing
+    Dim holeRadius As Double = 0
+    Dim axisPoint As Inventor.Point = Nothing
+    Dim axisDir As Inventor.UnitVector = Nothing
+    For Each f As Inventor.Face In body.Faces
+        Dim cyl As Inventor.Cylinder = TryCast(f.Geometry, Inventor.Cylinder)
+        If cyl Is Nothing Then Continue For
+        If cyl.Radius < 0.04 OrElse cyl.Radius > 3.0 Then Continue For
+        If holeFace Is Nothing OrElse cyl.Radius < holeRadius Then
+            holeFace = f
+            holeRadius = cyl.Radius
+            axisPoint = cyl.BasePoint
+            axisDir = cyl.AxisVector
+        End If
+    Next
+    If holeFace Is Nothing Then Throw New System.Exception("Could not find the hole through " & System.IO.Path.GetFileName(path) & ". A washer needs one cylindrical hole.")
+
+    Dim lowT As Double = 0
+    Dim highT As Double = 0
+    Dim haveEnd As Boolean = False
+    Dim lowArea As Double = 0
+    Dim highArea As Double = 0
+    For Each f As Inventor.Face In body.Faces
+        Dim pl As Inventor.Plane = TryCast(f.Geometry, Inventor.Plane)
+        If pl Is Nothing Then Continue For
+        If System.Math.Abs(pl.Normal.DotProduct(axisDir)) < 0.98 Then Continue For
+        Dim sample As Inventor.Point = f.PointOnFace
+        Dim t As Double = (sample.X - axisPoint.X) * axisDir.X + (sample.Y - axisPoint.Y) * axisDir.Y + (sample.Z - axisPoint.Z) * axisDir.Z
+        Dim area As Double = 0
+        Try
+            area = f.Evaluator.Area
+        Catch
+            area = 0
+        End Try
+        If Not haveEnd Then
+            lowT = t : highT = t : lowArea = area : highArea = area : haveEnd = True
+        ElseIf t < lowT - 0.002 Then
+            lowT = t : lowArea = area
+        ElseIf t > highT + 0.002 Then
+            highT = t : highArea = area
+        ElseIf System.Math.Abs(t - lowT) <= System.Math.Abs(t - highT) Then
+            lowArea += area
+        Else
+            highArea += area
+        End If
+    Next
+    If Not haveEnd OrElse highT - lowT < 0.002 Then
+        Throw New System.Exception("Could not find the two faces of " & System.IO.Path.GetFileName(path) & ".")
+    End If
+
+    Dim band As Double = System.Math.Max(0.03, (highT - lowT) * 0.35)
+    Dim lowFaces As Integer = 0
+    Dim highFaces As Integer = 0
+    For Each f As Inventor.Face In body.Faces
+        Dim sample As Inventor.Point = Nothing
+        Try
+            sample = f.PointOnFace
+        Catch
+            sample = Nothing
+        End Try
+        If sample Is Nothing Then Continue For
+        Dim t As Double = (sample.X - axisPoint.X) * axisDir.X + (sample.Y - axisPoint.Y) * axisDir.Y + (sample.Z - axisPoint.Z) * axisDir.Z
+        If System.Math.Abs(t - lowT) <= band Then lowFaces += 1
+        If System.Math.Abs(t - highT) <= band Then highFaces += 1
+    Next
+    Dim bearingT As Double = lowT
+    Dim axisSign As Double = 1
+    If MGHWasherBearingIsHighEnd(lowFaces, highFaces, lowArea, highArea) Then
+        bearingT = highT
+        axisSign = -1
+    End If
+
+    Dim bearingEdge As Inventor.Edge = Nothing
+    Dim bearingGap As Double = 0
+    Dim haveEdge As Boolean = False
+    For Each f As Inventor.Face In body.Faces
+        For Each e As Inventor.Edge In f.Edges
+            Dim edgeCenter As Inventor.Point = Nothing
+            Dim radius As Double = 0
+            If Not MGHCircularEdge(e, edgeCenter, radius) Then Continue For
+            If System.Math.Abs(radius - holeRadius) > System.Math.Max(0.05, holeRadius * 0.25) Then Continue For
+            Dim radial As Double = MGHDistanceToAxis(edgeCenter.X, edgeCenter.Y, edgeCenter.Z, _
+                axisPoint.X, axisPoint.Y, axisPoint.Z, axisDir.X, axisDir.Y, axisDir.Z)
+            If radial > 0.05 Then Continue For
+            Dim t As Double = (edgeCenter.X - axisPoint.X) * axisDir.X + (edgeCenter.Y - axisPoint.Y) * axisDir.Y + (edgeCenter.Z - axisPoint.Z) * axisDir.Z
+            Dim gap As Double = System.Math.Abs(t - bearingT)
+            If Not haveEdge OrElse gap < bearingGap Then
+                bearingEdge = e
+                bearingGap = gap
+                haveEdge = True
+            End If
+        Next
+    Next
+
+    Dim model As New MGHWasherModel()
+    model.Part = part
+    model.InnerRadius = holeRadius
+    model.Thickness = highT - lowT
+    model.BearingX = axisPoint.X + axisDir.X * bearingT
+    model.BearingY = axisPoint.Y + axisDir.Y * bearingT
+    model.BearingZ = axisPoint.Z + axisDir.Z * bearingT
+    model.AxisX = axisDir.X * axisSign
+    model.AxisY = axisDir.Y * axisSign
+    model.AxisZ = axisDir.Z * axisSign
+    model.MidX = model.BearingX + model.AxisX * model.Thickness / 2.0
+    model.MidY = model.BearingY + model.AxisY * model.Thickness / 2.0
+    model.MidZ = model.BearingZ + model.AxisZ * model.Thickness / 2.0
+    model.BearingEdge = bearingEdge
+    Return model
+End Function
+
+Function MGHMatrixMoved(app As Inventor.Application, before As Inventor.Matrix, after As Inventor.Matrix) As Boolean
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim samples() As Inventor.Point = { _
+        tg.CreatePoint(0, 0, 0), tg.CreatePoint(1, 0, 0), tg.CreatePoint(0, 1, 0), tg.CreatePoint(0, 0, 1)}
+    Dim i As Integer
+    For i = 0 To samples.Length - 1
+        Dim leftPoint As Inventor.Point = samples(i).Copy()
+        Dim rightPoint As Inventor.Point = samples(i).Copy()
+        leftPoint.TransformBy(before)
+        rightPoint.TransformBy(after)
+        If leftPoint.DistanceTo(rightPoint) > 0.001 Then Return True
+    Next
+    Return False
+End Function
+
+Function MGHWasherSitsOutside(occ As Inventor.ComponentOccurrence, model As MGHWasherModel, _
+    contact As Inventor.Point, outward As Inventor.UnitVector, app As Inventor.Application) As Boolean
+    Dim mid As Inventor.Point = app.TransientGeometry.CreatePoint(model.MidX, model.MidY, model.MidZ)
+    mid.TransformBy(occ.Transformation)
+    Dim signed As Double = (mid.X - contact.X) * outward.X + (mid.Y - contact.Y) * outward.Y + (mid.Z - contact.Z) * outward.Z
+    Return signed > model.Thickness * 0.2
+End Function
+
+Sub MGHSetWasherMatrix(app As Inventor.Application, occ As Inventor.ComponentOccurrence, model As MGHWasherModel, _
+    contact As Inventor.Point, outward As Inventor.UnitVector)
+    Dim fxx As Double, fxy As Double, fxz As Double, fyx As Double, fyy As Double, fyz As Double
+    Dim txx As Double, txy As Double, txz As Double, tyx As Double, tyy As Double, tyz As Double
+    MGHWasherBasis(model.AxisX, model.AxisY, model.AxisZ, fxx, fxy, fxz, fyx, fyy, fyz)
+    MGHWasherBasis(outward.X, outward.Y, outward.Z, txx, txy, txz, tyx, tyy, tyz)
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim matrix As Inventor.Matrix = tg.CreateMatrix()
+    matrix.SetToAlignCoordinateSystems( _
+        tg.CreatePoint(model.BearingX, model.BearingY, model.BearingZ), _
+        tg.CreateVector(fxx, fxy, fxz), tg.CreateVector(fyx, fyy, fyz), _
+        tg.CreateVector(model.AxisX, model.AxisY, model.AxisZ), _
+        contact, _
+        tg.CreateVector(txx, txy, txz), tg.CreateVector(tyx, tyy, tyz), _
+        tg.CreateVector(outward.X, outward.Y, outward.Z))
+    occ.Transformation = matrix
+End Sub
+
+Function MGHParseStoredPoint(app As Inventor.Application, text As String) As Inventor.Point
+    If text Is Nothing OrElse text = "" Then Return Nothing
+    Dim parts() As String = text.Split(","c)
+    If parts.Length <> 3 Then Return Nothing
+    Dim x As Double, y As Double, z As Double
+    If Not Double.TryParse(parts(0), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, x) Then Return Nothing
+    If Not Double.TryParse(parts(1), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, y) Then Return Nothing
+    If Not Double.TryParse(parts(2), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, z) Then Return Nothing
+    Return app.TransientGeometry.CreatePoint(x, y, z)
+End Function
+
+Function MGHFormatPoint(point As Inventor.Point) As String
+    Dim culture As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
+    Return point.X.ToString("0.000000", culture) & "," & point.Y.ToString("0.000000", culture) & "," & point.Z.ToString("0.000000", culture)
+End Function
+
+Function MGHUniqueOccurrenceName(occs As Inventor.ComponentOccurrences, requested As String) As String
+    Dim n As Integer
+    For n = 1 To 1000
+        Dim candidate As String = If(n = 1, requested, requested & " (" & n.ToString() & ")")
+        Dim exists As Boolean = False
+        For Each occ As Inventor.ComponentOccurrence In occs
+            If String.Equals(occ.Name, candidate, System.StringComparison.OrdinalIgnoreCase) Then
+                exists = True
+                Exit For
+            End If
+        Next
+        If Not exists Then Return candidate
+    Next
+    Throw New System.Exception("Could not find an unused component name.")
+End Function
+
+Sub MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    centers As System.Collections.Generic.List(Of Inventor.Point))
+    Dim doomed As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)()
+    For Each occ As Inventor.ComponentOccurrence In asm.ComponentDefinition.Occurrences
+        Try
+            If Not occ.AttributeSets.NameIsUsed("MGH_Hardware") Then Continue For
+            Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
+            If Not String.Equals(MGHGetAttr(aset, "Role"), "Washer", System.StringComparison.Ordinal) Then Continue For
+            Dim stored As Inventor.Point = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
+            If stored Is Nothing Then Continue For
+            For Each center As Inventor.Point In centers
+                If stored.DistanceTo(center) < 0.005 Then
+                    doomed.Add(occ)
+                    Exit For
+                End If
+            Next
+        Catch
+        End Try
+    Next
+    For Each occ As Inventor.ComponentOccurrence In doomed
+        occ.Delete()
+    Next
+End Sub
+
+' Empty result means the insert constraint seated the washer. Otherwise the washer is grounded in place.
+Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    plateOcc As Inventor.ComponentOccurrence, washerOcc As Inventor.ComponentOccurrence, _
+    holeEdge As Inventor.Edge, model As MGHWasherModel, contact As Inventor.Point, _
+    outward As Inventor.UnitVector) As String
+    Dim plateSaved As Inventor.Matrix = plateOcc.Transformation.Copy()
+    Dim washerSaved As Inventor.Matrix = washerOcc.Transformation.Copy()
+    Dim plateWasGrounded As Boolean = plateOcc.Grounded
+    Dim heldPlate As Boolean = False
+    If Not plateWasGrounded Then
+        Try
+            plateOcc.Grounded = True
+            heldPlate = True
+        Catch
+            heldPlate = False
+        End Try
+    End If
+    Dim inserted As Inventor.InsertConstraint = Nothing
+    Dim attempt As Integer
+    For attempt = 0 To 1
+        Dim opposed As Boolean = (attempt = 1)
+        If inserted IsNot Nothing Then
+            Try
+                inserted.Delete()
+            Catch
+            End Try
+            inserted = Nothing
+            Try
+                washerOcc.Transformation = washerSaved.Copy()
+            Catch
+            End Try
+        End If
+        Try
+            Dim holeProxy As Object = Nothing
+            Dim washerProxy As Object = Nothing
+            plateOcc.CreateGeometryProxy(holeEdge, holeProxy)
+            washerOcc.CreateGeometryProxy(model.BearingEdge, washerProxy)
+            inserted = asm.ComponentDefinition.Constraints.AddInsertConstraint(washerProxy, holeProxy, opposed, 0)
+            asm.Update2(True)
+        Catch
+            inserted = Nothing
+        End Try
+        If inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app) Then Exit For
+    Next
+    If heldPlate Then
+        Try
+            plateOcc.Grounded = False
+        Catch
+        End Try
+    End If
+    Dim plateMoved As Boolean = MGHMatrixMoved(app, plateSaved, plateOcc.Transformation)
+    Dim seated As Boolean = inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app)
+    If plateMoved OrElse Not seated Then
+        If inserted IsNot Nothing Then
+            Try
+                inserted.Delete()
+            Catch
+            End Try
+        End If
+        Try
+            plateOcc.Transformation = plateSaved
+        Catch
+        End Try
+        Try
+            washerOcc.Transformation = washerSaved
+        Catch
+        End Try
+        washerOcc.Grounded = True
+        If plateMoved Then Return "grounded so the plate would not move"
+        Return "positioned and grounded because the insert constraint did not seat it"
+    End If
+    Return ""
+End Function
+
+Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    plateOcc As Inventor.ComponentOccurrence, plateDef As Inventor.PartComponentDefinition, _
+    plateFace As Inventor.Face, groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup)) As String
+    Dim notes As New System.Collections.Generic.List(Of String)()
+    Dim sizes As New System.Collections.Generic.List(Of String)()
+    For Each g As OutputGroup In groups.Values
+        Dim folderNames() As String = MGHSizeFolderNames(g.Screw)
+        If folderNames.Length = 0 Then
+            If g.Screw IsNot Nothing AndAlso String.Equals(g.Screw.Trim(), "Custom", System.StringComparison.OrdinalIgnoreCase) Then
+                notes.Add("Custom fastener '" & g.Label & "' has no size folder, so no washer was requested.")
+            End If
+            Continue For
+        End If
+        Dim sizeName As String = g.Screw.Trim()
+        If Not sizes.Contains(sizeName) Then sizes.Add(sizeName)
+    Next
+    If sizes.Count = 0 Then
+        If notes.Count = 0 Then Return "Washers: no fastener sizes to match a hardware folder."
+        Return "Washers were not placed." & vbCrLf & String.Join(vbCrLf, notes.ToArray())
+    End If
+
+    Dim library As String = MGHReadHardwareLibrary(asm)
+    If library = "" OrElse Not System.IO.Directory.Exists(library) Then library = MGHDefaultHardwareLibrary()
+    Dim sideDialog As New MGHWasherSideDialog(library)
+    Dim sideResult As System.Windows.Forms.DialogResult = sideDialog.ShowDialog()
+    Dim onSelectedFace As Boolean = sideDialog.OnSelectedFace
+    library = sideDialog.LibraryPath
+    sideDialog.Dispose()
+    If sideResult <> System.Windows.Forms.DialogResult.OK Then Return "Washers: skipped."
+    If library = "" OrElse Not System.IO.Directory.Exists(library) Then
+        Dim browsed As String = MGHBrowseHardwareLibrary(library)
+        If browsed = "" OrElse Not System.IO.Directory.Exists(browsed) Then Return "Washers: skipped. The hardware folder was not found."
+        library = browsed
+    End If
+    If library.Length > 255 Then
+        notes.Add("The hardware folder path is longer than 255 characters, so it will not be remembered on the assembly.")
+    Else
+        MGHWriteHardwareLibrary(asm, library)
+    End If
+
+    Dim chosen As New System.Collections.Generic.Dictionary(Of String, String)(System.StringComparer.OrdinalIgnoreCase)
+    For Each sizeName As String In sizes
+        Dim washerDir As String = MGHResolveRoleDirectory(library, sizeName, "Washers")
+        Dim expected As String = MGHPreferredRoleDirectory(library, sizeName, "Washers")
+        Dim startDir As String = washerDir
+        If startDir = "" Then
+            System.Windows.Forms.MessageBox.Show( _
+                "No Washers folder was found for " & sizeName & "." & vbCrLf & _
+                "Expected: " & expected & vbCrLf & _
+                "The file window will open at the hardware folder so you can browse to the part.", _
+                "Grouped Mounting Holes")
+            startDir = library
+        End If
+        Dim picked As String = MGHPickPartFile(app, "Select the " & sizeName & " washer — " & startDir, startDir)
+        If picked = "" Then
+            notes.Add(sizeName & " washer was skipped.")
+            Continue For
+        End If
+        If Not picked.EndsWith(".ipt", System.StringComparison.OrdinalIgnoreCase) OrElse Not System.IO.File.Exists(picked) Then
+            notes.Add(sizeName & " washer was skipped because the selected file is not an Inventor part.")
+            Continue For
+        End If
+        chosen.Add(sizeName, picked)
+    Next
+    If chosen.Count = 0 Then
+        Return "Washers: no files selected." & If(notes.Count = 0, "", vbCrLf & String.Join(vbCrLf, notes.ToArray()))
+    End If
+
+    Dim models As New System.Collections.Generic.Dictionary(Of String, MGHWasherModel)(System.StringComparer.OrdinalIgnoreCase)
+    Dim chosenSizes As New System.Collections.Generic.List(Of String)(chosen.Keys)
+    For Each sizeName As String In chosenSizes
+        Try
+            models.Add(sizeName, MGHReadWasher(app, chosen(sizeName)))
+        Catch ex As System.Exception
+            notes.Add(sizeName & " washer was not placed (" & ex.Message & ").")
+            chosen.Remove(sizeName)
+        End Try
+    Next
+    If models.Count = 0 Then
+        Return "Washers were not placed." & vbCrLf & String.Join(vbCrLf, notes.ToArray())
+    End If
+
+    Dim targetCenters As New System.Collections.Generic.List(Of Inventor.Point)()
+    For Each g As OutputGroup In groups.Values
+        If g.Screw Is Nothing OrElse Not models.ContainsKey(g.Screw.Trim()) Then Continue For
+        For Each center As Inventor.Point In g.Centers
+            targetCenters.Add(center)
+        Next
+    Next
+
+    Dim placed As Integer = 0
+    Dim replaced As Integer = 0
+    Dim trans As Inventor.Transaction = app.TransactionManager.StartTransaction(asm, "Place Grouped Mounting Washers")
+    Try
+        Dim beforeDelete As Integer = asm.ComponentDefinition.Occurrences.Count
+        MGHRemoveWashersAt(app, asm, targetCenters)
+        replaced = beforeDelete - asm.ComponentDefinition.Occurrences.Count
+        Dim outwardPlate As Inventor.UnitVector = MGHFaceOutward(plateFace, plateFace.SurfaceBody, app)
+        Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+        For Each g As OutputGroup In groups.Values
+            If g.Screw Is Nothing OrElse Not models.ContainsKey(g.Screw.Trim()) Then Continue For
+            Dim model As MGHWasherModel = models(g.Screw.Trim())
+            Dim sizeName As String = g.Screw.Trim()
+            For Each center As Inventor.Point In g.Centers
+                Dim washerOcc As Inventor.ComponentOccurrence = Nothing
+                Dim kept As Boolean = False
+                Try
+                    app.StatusBarText = "Placing " & sizeName & " washer"
+                    Dim holeEdge As Inventor.Edge = MGHFindHoleRim(plateDef, center, outwardPlate, onSelectedFace)
+                    If holeEdge Is Nothing AndAlso Not onSelectedFace Then
+                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far side of the hole was not found.")
+                        Continue For
+                    End If
+                    Dim contactPlate As Inventor.Point
+                    Dim outwardPart As Inventor.UnitVector
+                    If onSelectedFace Then
+                        contactPlate = center.Copy()
+                        outwardPart = outwardPlate
+                    Else
+                        Dim farCenter As Inventor.Point = Nothing
+                        Dim farRadius As Double = 0
+                        If Not MGHCircularEdge(holeEdge, farCenter, farRadius) Then
+                            notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far rim is not circular.")
+                            Continue For
+                        End If
+                        contactPlate = farCenter.Copy()
+                        outwardPart = tg.CreateUnitVector(-outwardPlate.X, -outwardPlate.Y, -outwardPlate.Z)
+                    End If
+                    Dim contact As Inventor.Point = contactPlate.Copy()
+                    contact.TransformBy(plateOcc.Transformation)
+                    ' Transform two points and subtract so a direction is not shifted by the plate origin.
+                    Dim originPt As Inventor.Point = tg.CreatePoint(0, 0, 0)
+                    Dim tipPt As Inventor.Point = tg.CreatePoint(outwardPart.X, outwardPart.Y, outwardPart.Z)
+                    originPt.TransformBy(plateOcc.Transformation)
+                    tipPt.TransformBy(plateOcc.Transformation)
+                    Dim dirX As Double = tipPt.X - originPt.X
+                    Dim dirY As Double = tipPt.Y - originPt.Y
+                    Dim dirZ As Double = tipPt.Z - originPt.Z
+                    Dim dirLen As Double = System.Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ)
+                    If dirLen < 0.000000001 Then Throw New System.Exception("The plate transform has no direction for the washer.")
+                    Dim outwardAsm As Inventor.UnitVector = tg.CreateUnitVector(dirX / dirLen, dirY / dirLen, dirZ / dirLen)
+                    washerOcc = asm.ComponentDefinition.Occurrences.Add(model.Part.FullFileName, tg.CreateMatrix())
+                    MGHSetWasherMatrix(app, washerOcc, model, contact, outwardAsm)
+                    Try
+                        washerOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Washer " & sizeName)
+                    Catch
+                    End Try
+                    Dim warning As String = ""
+                    If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
+                        warning = MGHConstrainWasher(app, asm, plateOcc, washerOcc, holeEdge, model, contact, outwardAsm)
+                    Else
+                        washerOcc.Grounded = True
+                        warning = "positioned and grounded because a circular rim was not found"
+                    End If
+                    Dim aset As Inventor.AttributeSet = washerOcc.AttributeSets.Add("MGH_Hardware", True)
+                    MGHPutAttr(aset, "Role", "Washer")
+                    MGHPutAttr(aset, "Size", sizeName)
+                    MGHPutAttr(aset, "Center", MGHFormatPoint(center))
+                    MGHPutAttr(aset, "Side", If(onSelectedFace, "Selected", "Opposite"))
+                    MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
+                    kept = True
+                    placed += 1
+                    If warning <> "" Then notes.Add(sizeName & " washer " & washerOcc.Name & " was " & warning & ".")
+                Catch ex As System.Exception
+                    If washerOcc IsNot Nothing AndAlso Not kept Then
+                        Try
+                            washerOcc.Delete()
+                        Catch
+                        End Try
+                    End If
+                    notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " failed: " & ex.Message)
+                End Try
+            Next
+        Next
+        If placed = 0 Then
+            Dim hadPrevious As Boolean = replaced > 0
+            trans.Abort()
+            replaced = 0
+            If hadPrevious Then notes.Add("Existing washers were left in place.")
+        Else
+            trans.End()
+        End If
+    Catch ex As System.Exception
+        Try
+            trans.Abort()
+        Catch
+        End Try
+        Throw New System.Exception("Washer placement was rolled back. " & ex.Message)
+    End Try
+    app.StatusBarText = ""
+
+    Dim summary As New System.Text.StringBuilder()
+    summary.Append("Washers placed: " & placed.ToString())
+    If replaced > 0 Then summary.Append(vbCrLf & "Previous washers replaced: " & replaced.ToString())
+    If notes.Count > 0 Then
+        summary.Append(vbCrLf & "Washer notes:")
+        For Each noteText As String In notes
+            summary.Append(vbCrLf & "- " & noteText)
+        Next
+    End If
+    Return summary.ToString()
+End Function
+
 
 Function MGHDefaultThread(size As String) As String
     Select Case size
