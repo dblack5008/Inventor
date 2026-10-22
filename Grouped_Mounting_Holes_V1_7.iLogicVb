@@ -1,0 +1,1856 @@
+﻿' GROUPED MOUNTING HOLES - v1.7 (countersink 82/100 dropdown + exact seat verification) (Inventor 2027, assembly-level EXTERNAL iLogic rule)
+' Uses native part Hole features: one feature and one point sketch per unique hole specification.
+' Operates on the part file referenced by the selected plate occurrence. DOES NOT move components.
+' Select a planar plate face, select multiple circular edges OR cylindrical mounting-hole faces,
+' click FINISH SELECTION & REVIEW to finish (no ESC dependence). Clicked rims stay cyan while selecting.
+' Review groups, then commit. Inward direction is VERIFIED by checking that solid
+' material is removed at EVERY selected hole center (and flipped if necessary).
+' Native progress bars report both review/validation and hole generation.
+' Countersink: angle dropdown defaults to 82 degrees (100 available); entered
+' seat diameter and angle are reapplied AFTER clearance association and
+' VERIFIED again after part recompute. No silent reversion to table defaults.
+' Supports native clearance holes, tapped holes, custom holes, and none/counterbore/countersink/spotface seats.
+' Group identity includes the entire size/thread/seat specification, with one feature per group.
+' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
+' Default recommendations skip odd fastener numbers after #3.
+' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
+' IMPORTANT: Diameter presets are editable initial suggestions, NOT queried from Inventor's
+' local Clearance.xls. Always use the fastener/PEM manufacturer's installation requirements.
+' This is a test-ready first version. First run on a COPY of an assembly and plate.
+'
+Sub Main()
+    Dim app As Inventor.Application = ThisApplication
+    Dim aDoc As Inventor.AssemblyDocument = TryCast(app.ActiveDocument, Inventor.AssemblyDocument)
+    If aDoc Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("Open an .iam assembly before running this rule.", "Grouped Mounting Holes")
+        Exit Sub
+    End If
+
+    ' Inventor 2027: CommandManager.Pick may ignore ESC. Use event-based
+    ' selection with a visible Cancel button instead, including for the plate.
+    Dim plateSelector As New MGHInteractionSelector()
+    Dim gotFace As Boolean = plateSelector.Run( _
+        app, Inventor.SelectionFilterEnum.kPartFacePlanarFilter, _
+        "Select Mounting Plate", _
+        "Click the flat mounting face of the plate. The rule will automatically continue.", True)
+    If Not gotFace OrElse plateSelector.Picked.Count = 0 Then Exit Sub
+    Dim faceObj As Object = plateSelector.Picked(0)
+    Dim plateFaceProxy As Inventor.FaceProxy = TryCast(faceObj, Inventor.FaceProxy)
+    If plateFaceProxy Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("Select a planar face belonging to an actual plate part occurrence.")
+        Exit Sub
+    End If
+
+    Dim plateOcc As Inventor.ComponentOccurrence = plateFaceProxy.ContainingOccurrence
+    If TypeOf plateOcc Is Inventor.ComponentOccurrenceProxy Then
+        System.Windows.Forms.MessageBox.Show("Version 1 requires the plate to be a TOP-LEVEL part in this assembly (not inside a subassembly).")
+        Exit Sub
+    End If
+    Dim plateDef As Inventor.PartComponentDefinition = TryCast(plateOcc.Definition, Inventor.PartComponentDefinition)
+    If plateDef Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("The selected plate is not an editable .ipt part.")
+        Exit Sub
+    End If
+    Dim plateDoc As Inventor.PartDocument = TryCast(plateDef.Document, Inventor.PartDocument)
+    If plateDoc Is Nothing OrElse Not plateDoc.IsModifiable Then
+        System.Windows.Forms.MessageBox.Show("The plate .ipt is not modifiable. Check read-only, library, and active-edit state.")
+        Exit Sub
+    End If
+
+    Dim plateNativeFace As Inventor.Face = plateFaceProxy.NativeObject
+    Dim platePlane As Inventor.Plane = TryCast(plateNativeFace.Geometry, Inventor.Plane)
+    Dim plateAssemblyPlane As Inventor.Plane = TryCast(plateFaceProxy.Geometry, Inventor.Plane)
+    If platePlane Is Nothing OrElse plateAssemblyPlane Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("The selected plate face must be planar.")
+        Exit Sub
+    End If
+
+    Dim invertPlate As Inventor.Matrix = plateOcc.Transformation.Copy()
+    invertPlate.Invert()
+
+    ' Custom labeled options replace misleading Yes / No buttons.
+    Dim modeDialog As New MGHModeDialog()
+    Dim modeChoice As System.Windows.Forms.DialogResult = modeDialog.ShowDialog()
+    modeDialog.Dispose()
+    If modeChoice <> System.Windows.Forms.DialogResult.Yes AndAlso _
+       modeChoice <> System.Windows.Forms.DialogResult.No Then Exit Sub
+    Dim selectEdges As Boolean = (modeChoice = System.Windows.Forms.DialogResult.Yes)
+    Dim pickFilter As Inventor.SelectionFilterEnum = If(selectEdges, _
+        Inventor.SelectionFilterEnum.kPartEdgeCircularFilter, _
+        Inventor.SelectionFilterEnum.kPartFaceCylindricalFilter)
+
+    Dim holeSelector As New MGHInteractionSelector()
+    Dim gotHoles As Boolean = holeSelector.Run( _
+        app, pickFilter, "Select Component Mounting Holes", _
+        "Click each " & If(selectEdges, "circular hole rim", "cylindrical hole wall") & _
+        ". When finished, click FINISH SELECTION & REVIEW in the floating palette.", False)
+    If Not gotHoles Then Exit Sub
+
+    Dim selected As New System.Collections.Generic.List(Of MountPoint)()
+    Dim excluded As New System.Collections.Generic.List(Of String)()
+    For Each item As Object In holeSelector.Picked
+        Try
+            Dim measuredCenter As Inventor.Point = Nothing
+            Dim measuredAxis As Inventor.UnitVector = Nothing
+            Dim radiusCm As Double = 0
+            Dim sourceName As String = ""
+            Dim sourceOccurrence As Inventor.ComponentOccurrence = Nothing
+
+            If selectEdges Then
+                Dim e As Inventor.EdgeProxy = TryCast(item, Inventor.EdgeProxy)
+                If e Is Nothing Then Throw New System.Exception("Not an assembly circular edge.")
+                Dim circ As Inventor.Circle = TryCast(e.Geometry, Inventor.Circle)
+                If circ Is Nothing Then Throw New System.Exception("Only full circular edges are supported; select the complete hole rim.")
+                measuredCenter = circ.Center
+                measuredAxis = circ.Normal
+                radiusCm = circ.Radius
+                sourceOccurrence = e.ContainingOccurrence
+            Else
+                Dim f As Inventor.FaceProxy = TryCast(item, Inventor.FaceProxy)
+                If f Is Nothing Then Throw New System.Exception("Not an assembly cylindrical face.")
+                Dim cyl As Inventor.Cylinder = TryCast(f.Geometry, Inventor.Cylinder)
+                If cyl Is Nothing Then Throw New System.Exception("Selected face is not cylindrical.")
+                measuredCenter = cyl.BasePoint
+                measuredAxis = cyl.AxisVector
+                radiusCm = cyl.Radius
+                sourceOccurrence = f.ContainingOccurrence
+            End If
+            sourceName = sourceOccurrence.Name
+            If sourceOccurrence.Definition.Document.FullFileName = plateDoc.FullFileName Then
+                Throw New System.Exception("Source is a face/edge on the plate itself.")
+            End If
+            If radiusCm <= 0.0 Then Throw New System.Exception("Invalid radius.")
+            If System.Math.Abs(measuredAxis.DotProduct(plateAssemblyPlane.Normal)) < 0.9990 Then
+                Throw New System.Exception("Hole axis is not perpendicular to the plate (tolerance about 2.6 deg).")
+            End If
+
+            ' Geometry of proxies is in assembly space. Transform into *plate-part* space;
+            ' never manipulate assembly component position or use camera/view orientation.
+            Dim inPlate As Inventor.Point = measuredCenter.Copy()
+            inPlate.TransformBy(invertPlate)
+            Dim onPlane As Inventor.Point = ProjectToPlane(inPlate, platePlane, app)
+            Dim nearest As Inventor.Point = plateNativeFace.GetClosestPointTo(onPlane)
+            If nearest.DistanceTo(onPlane) > 0.003 Then ' 0.03 mm, Inventor internal cm
+                Throw New System.Exception("Projected center is outside plate face or within an existing opening.")
+            End If
+            Dim alreadySelected As Boolean = False
+            For Each prior As MountPoint In selected
+                If prior.Center.DistanceTo(onPlane) < 0.005 Then ' 0.05 mm
+                    alreadySelected = True
+                    Exit For
+                End If
+            Next
+            If alreadySelected Then Throw New System.Exception("That hole center is already selected.")
+
+            Dim rec As New MountPoint()
+            rec.Center = onPlane
+            rec.SourceDiameterIn = (radiusCm * 2.0 / 2.54)
+            rec.SourceName = sourceName
+            selected.Add(rec)
+        Catch ex As System.Exception
+            excluded.Add("Skipped selection " & (selected.Count + excluded.Count + 1).ToString() & ": " & ex.Message)
+        End Try
+    Next
+
+    If selected.Count = 0 Then
+        System.Windows.Forms.MessageBox.Show("No usable component holes selected." & _
+            If(excluded.Count > 0, vbCrLf & String.Join(vbCrLf, excluded.ToArray()), ""), "No changes")
+        Exit Sub
+    End If
+
+    Dim buckets As New System.Collections.Generic.SortedDictionary(Of String, InputBucket)(System.StringComparer.Ordinal)
+    For Each m As MountPoint In selected
+        Dim key As String = m.SourceDiameterIn.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)
+        If Not buckets.ContainsKey(key) Then
+            Dim b As New InputBucket()
+            b.SourceKey = key
+            b.Screw = GuessFastener(m.SourceDiameterIn)
+            b.Fit = "Normal"
+            b.Mode = "Clearance"
+            b.Seat = "None"
+            b.ThreadType = "ANSI Unified Screw Threads"
+            b.ThreadDesignation = MGHDefaultThread(b.Screw)
+            b.ThreadClass = "2B"
+            b.ClearanceStandard = "Ansi Unified Screw Threads"
+            b.ClearanceFamily = "Flat Head Machine Screw (100)"
+            b.DiameterIn = PresetDiameter(b.Screw, b.Fit)
+            b.GroupLabel = "Hole " & b.Screw & " - Normal"
+            buckets.Add(key, b)
+        End If
+        buckets(key).Centers.Add(m.Center)
+    Next
+
+    Dim review As New HoleReviewForm(buckets)
+    review.Text = "Grouped Mounting Holes - " & plateDoc.DisplayName
+    Dim outcome As System.Windows.Forms.DialogResult = review.ShowDialog()
+    If outcome <> System.Windows.Forms.DialogResult.OK Then Exit Sub
+
+    ' Review and Generate can take a while when many hole positions are checked.
+    ' Create a SECOND, clearly labeled progress bar *before* the checks start.
+    Dim reviewProgress As Inventor.ProgressBar = Nothing
+    Dim reviewOperation As String = "Preparing review"
+    Dim planeID As String = ""
+    Dim desiredGroups As New System.Collections.Generic.SortedDictionary(Of String, OutputGroup)(System.StringComparer.Ordinal)
+    Dim preview As New System.Text.StringBuilder()
+    Try
+        Dim reviewSteps As Integer = 4 + buckets.Count + selected.Count
+        reviewProgress = app.CreateProgressBar(False, reviewSteps, "Grouped Mounting Holes - Reviewing / Validating")
+        MGHProgressTick(reviewProgress, app, "Collecting selected mounting-hole specifications")
+        planeID = StablePlaneKey(platePlane)
+        For Each b As InputBucket In buckets.Values
+            reviewOperation = "Validating specification for source Ø" & b.SourceKey
+            MGHProgressMessage(reviewProgress, app, reviewOperation)
+            If String.IsNullOrWhiteSpace(b.GroupLabel) Then Throw New System.Exception("Group name is required for Ø" & b.SourceKey)
+            If b.Mode <> "Threaded" AndAlso (b.DiameterIn <= 0.01 OrElse b.DiameterIn > 2.0) Then
+                Throw New System.Exception("Invalid target Ø for source " & b.SourceKey)
+            End If
+            If b.Mode = "Clearance" Then
+                If b.ClearanceStandard.Trim() = "" OrElse b.ClearanceFamily.Trim() = "" Then
+                    Throw New System.Exception("Enter Inventor clearance standard and fastener family for " & b.GroupLabel)
+                End If
+            End If
+            If b.Mode = "Threaded" Then
+                If b.ThreadType.Trim() = "" OrElse b.ThreadDesignation.Trim() = "" OrElse b.ThreadClass.Trim() = "" Then
+                    Throw New System.Exception("Threaded group '" & b.GroupLabel & "' needs a type, designation and internal class.")
+                End If
+            End If
+            If b.Seat <> "None" Then
+                If b.SeatDiameterIn <= 0 Then Throw New System.Exception("Enter a seat diameter for " & b.GroupLabel)
+                If b.Seat = "Countersink" Then
+                    If b.SeatAngleDeg <= 0 OrElse b.SeatAngleDeg >= 180 Then Throw New System.Exception("Countersink angle must be between 0 and 180 degrees.")
+                Else
+                    If b.SeatDepthIn <= 0 Then Throw New System.Exception("Enter a positive seat depth for " & b.GroupLabel)
+                End If
+                If b.Mode <> "Threaded" AndAlso b.SeatDiameterIn <= b.DiameterIn Then
+                    Throw New System.Exception("Seat Ø must exceed the hole Ø for " & b.GroupLabel)
+                End If
+            End If
+            Dim legacyKey As String = planeID & "|" & b.Screw & "|" & b.Fit & "|" & _
+                b.DiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
+                "|" & b.GroupLabel.Trim().ToUpperInvariant()
+            Dim key As String = legacyKey & "|V16|" & b.Mode.ToUpperInvariant() & "|" & b.Seat.ToUpperInvariant() & _
+                "|" & b.SeatDiameterIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
+                "|" & b.SeatDepthIn.ToString("0.000000", System.Globalization.CultureInfo.InvariantCulture) & _
+                "|" & b.SeatAngleDeg.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture) & _
+                "|" & b.ThreadType.Trim().ToUpperInvariant() & "|" & b.ThreadDesignation.Trim().ToUpperInvariant() & "|" & b.ThreadClass.Trim().ToUpperInvariant() & _
+                "|" & b.ClearanceStandard.Trim().ToUpperInvariant() & "|" & b.ClearanceFamily.Trim().ToUpperInvariant()
+            If Not desiredGroups.ContainsKey(key) Then
+                Dim g As New OutputGroup()
+                g.Key = key : g.LegacyKey = legacyKey
+                g.Label = b.GroupLabel.Trim() : g.DiameterIn = b.DiameterIn
+                g.Screw = b.Screw : g.Fit = b.Fit : g.Mode = b.Mode : g.Seat = b.Seat
+                g.SeatDiameterIn = b.SeatDiameterIn : g.SeatDepthIn = b.SeatDepthIn : g.SeatAngleDeg = b.SeatAngleDeg
+                g.ThreadType = b.ThreadType : g.ThreadDesignation = b.ThreadDesignation : g.ThreadClass = b.ThreadClass
+                g.ClearanceStandard = b.ClearanceStandard : g.ClearanceFamily = b.ClearanceFamily
+                desiredGroups.Add(key, g)
+            End If
+            For Each p As Inventor.Point In b.Centers
+                desiredGroups(key).Centers.Add(p)
+            Next
+            MGHProgressTick(reviewProgress, app, "Grouped source Ø" & b.SourceKey & " — " & b.Centers.Count.ToString() & " positions")
+        Next
+
+        ' Test full seat envelope (NOT only pilot/core hole diameter).
+        reviewOperation = "Checking selected face boundaries and hole/seat interference"
+        MGHProgressTick(reviewProgress, app, reviewOperation)
+        Dim allLocations As New System.Collections.Generic.List(Of Inventor.Point)()
+        Dim allRadii As New System.Collections.Generic.List(Of Double)()
+        For Each g As OutputGroup In desiredGroups.Values
+            Dim effectiveDiameter As Double = g.DiameterIn
+            If g.Mode = "Threaded" Then
+                ' Use the nominal major diameter from the actual thread designation
+                ' as the conservative envelope, not the minor/tap-drill diameter.
+                effectiveDiameter = MGHThreadNominalFromDesignation(g.ThreadDesignation)
+                If effectiveDiameter <= 0 Then effectiveDiameter = MGHThreadNominalDiameter(g.Screw)
+                If effectiveDiameter <= 0 Then
+                    Dim designation As String = g.ThreadDesignation.Trim().ToUpperInvariant()
+                    If designation.StartsWith("M") Then
+                        Dim cap As String = designation.Substring(1).Split("X"c)(0)
+                        Dim nominalMm As Double=0
+                        If Double.TryParse(cap,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,nominalMm) Then
+                            effectiveDiameter=nominalMm/25.4
+                        End If
+                    End If
+                End If
+                If effectiveDiameter <= 0 Then
+                    Throw New System.Exception("Cannot validate the pilot hole diameter for custom thread " & g.ThreadDesignation & _
+                        ". Choose a nominal screw size or use an M# thread designation.")
+                End If
+            End If
+            If g.Seat <> "None" Then effectiveDiameter = System.Math.Max(effectiveDiameter, g.SeatDiameterIn)
+            Dim radius As Double = effectiveDiameter * 2.54 / 2.0
+            For Each pos As Inventor.Point In g.Centers
+                reviewOperation = "Checking " & g.Label & " — location " & (allLocations.Count + 1).ToString()
+                MGHProgressMessage(reviewProgress, app, reviewOperation)
+                For Each perimeter As Inventor.Edge In plateNativeFace.Edges
+                    Dim onEdge As Inventor.Point = perimeter.GetClosestPointTo(pos)
+                    If onEdge.DistanceTo(pos) + 0.0001 < radius Then
+                        Throw New System.Exception("Hole/seat '" & g.Label & "' envelope would intersect plate-face boundary or opening.")
+                    End If
+                Next
+                For j As Integer = 0 To allLocations.Count - 1
+                    If pos.DistanceTo(allLocations(j)) + 0.0001 < radius + allRadii(j) Then
+                        Throw New System.Exception("Two requested hole/seat envelopes overlap. Adjust sizes or locations before continuing.")
+                    End If
+                Next
+                allLocations.Add(pos) : allRadii.Add(radius)
+                MGHProgressTick(reviewProgress, app, "Checked " & allLocations.Count.ToString() & "/" & selected.Count.ToString() & " hole/seat envelopes")
+            Next
+        Next
+        reviewOperation = "Building final preview for " & desiredGroups.Count.ToString() & " groups"
+        MGHProgressTick(reviewProgress, app, reviewOperation)
+        preview.AppendLine("Part: " & plateDoc.DisplayName)
+        preview.AppendLine("Input selections: " & selected.Count.ToString())
+        preview.AppendLine("Unique output groups: " & desiredGroups.Count.ToString())
+        preview.AppendLine()
+        For Each g As OutputGroup In desiredGroups.Values
+            Dim detail As String = If(g.Mode = "Threaded", g.ThreadDesignation & " / " & g.ThreadClass, _
+                "Ø" & g.DiameterIn.ToString("0.0000") & " in")
+            Dim seatDetail As String = If(g.Seat = "None", "", " + " & g.Seat & " Ø" & _
+                g.SeatDiameterIn.ToString("0.0000") & " in")
+            preview.AppendLine(g.Label & "  [" & g.Mode & "] " & detail & seatDetail & _
+                "  (" & g.Centers.Count.ToString() & " positions)")
+        Next
+        preview.AppendLine()
+        preview.AppendLine("All pilot holes are THROUGH ALL. Threaded holes use FULL-length model threads.")
+        preview.AppendLine("Native standard clearance and thread dimensions come from Inventor's local tables.")
+        preview.AppendLine("This modifies the REAL plate .ipt and every assembly occurrence of it.")
+        preview.AppendLine("The script does NOT save the part automatically. Make a backup first.")
+        If excluded.Count > 0 Then
+            preview.AppendLine()
+            preview.AppendLine(excluded.Count.ToString() & " selections were skipped:")
+            For Each msg As String In excluded
+                preview.AppendLine("- " & msg)
+            Next
+        End If
+        preview.AppendLine()
+        preview.Append("Verify the specifications, then choose GENERATE HOLES to proceed.")
+        MGHProgressTick(reviewProgress, app, "Validation finished — ready for final confirmation")
+    Catch ex As System.Exception
+        System.Windows.Forms.MessageBox.Show("Review validation failed: " & reviewOperation & vbCrLf & ex.Message, "Grouped Mounting Holes")
+        Exit Sub
+    Finally
+        If reviewProgress IsNot Nothing Then
+            Try
+                reviewProgress.Close()
+            Catch
+            End Try
+        End If
+    End Try
+
+    Dim approval As New MGHGenerateDialog(preview.ToString())
+    Dim approvalResult As System.Windows.Forms.DialogResult = approval.ShowDialog()
+    approval.Dispose()
+    If approvalResult <> System.Windows.Forms.DialogResult.OK Then Exit Sub
+
+    Dim trans As Inventor.Transaction = Nothing
+    Dim progress As Inventor.ProgressBar = Nothing
+    Dim operationInfo As String = "Starting plate transaction"
+    Try
+        ' Every tick represents a REAL completed unit of work; no estimated clock times.
+        ' Steps: begin, scan, (prepare + finish each group), each selected location,
+        ' final recompute, commit.
+        Dim progressSteps As Integer = 4 + 2 * desiredGroups.Count
+        For Each gg As OutputGroup In desiredGroups.Values
+            progressSteps += gg.Centers.Count
+        Next
+        progress = app.CreateProgressBar(False, progressSteps, "Grouped Mounting Holes - Generating")
+        progress.Message = "Opening transaction for " & plateDoc.DisplayName
+        trans = app.TransactionManager.StartTransaction(plateDoc, "Generate Grouped Mounting Holes")
+        MGHProgressTick(progress, app, "Plate transaction started - checking existing groups")
+        Dim holes As Inventor.HoleFeatures = plateDef.Features.HoleFeatures
+        Dim existing As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
+        For Each feat As Inventor.HoleFeature In holes
+            Try
+                If feat.AttributeSets.NameIsUsed("MGH_Generator") Then
+                    Dim att As Inventor.AttributeSet = feat.AttributeSets.Item("MGH_Generator")
+                    Dim savedKey As String = CStr(att.Item("GroupKey").Value)
+                    If existing.ContainsKey(savedKey) Then Throw New System.Exception("Duplicate internal group identifiers")
+                    existing.Add(savedKey, feat)
+                End If
+            Catch ex As System.Exception
+                If ex.Message = "Duplicate internal group identifiers" Then Throw
+                ' Unrecognized legacy feature metadata is deliberately ignored.
+            End Try
+        Next
+
+        ' Upgrade the identity of V1.5 simple groups when their original spec matches.
+        ' Do not migrate legacy sketches into newly seated or threaded groups.
+        Dim migrateLegacy As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
+        For Each g As OutputGroup In desiredGroups.Values
+            If Not existing.ContainsKey(g.Key) AndAlso g.Mode = "Clearance" AndAlso g.Seat = "None" Then
+                If existing.ContainsKey(g.LegacyKey) Then
+                    existing.Add(g.Key, existing(g.LegacyKey))
+                    migrateLegacy.Add(g.Key, existing(g.LegacyKey))
+                End If
+            End If
+        Next
+        MGHProgressTick(progress, app, "Existing groups indexed - preparing " & desiredGroups.Count.ToString() & " size groups")
+
+        ' Prepare every NEW sketch BEFORE cutting: subsequent cuts can change face topology.
+        ' For each sketch, derive its +normal from its sketch coordinates and use
+        ' SurfaceBody.IsPointInside to verify WHICH DIRECTION ENTERS THE SOLID.
+        ' Do NOT assume kNegative is the right direction and do NOT use COM success
+        ' as evidence a Hole feature removed material.
+        Dim newSketches As New System.Collections.Generic.Dictionary(Of String, Inventor.PlanarSketch)(System.StringComparer.Ordinal)
+        Dim newCenters As New System.Collections.Generic.Dictionary(Of String, Inventor.ObjectCollection)(System.StringComparer.Ordinal)
+        Dim inwardDirections As New System.Collections.Generic.Dictionary(Of String, Inventor.PartFeatureExtentDirectionEnum)(System.StringComparer.Ordinal)
+        Dim interiorTestPoints As New System.Collections.Generic.Dictionary(Of String, System.Collections.Generic.List(Of Inventor.Point))(System.StringComparer.Ordinal)
+        Dim flippedGroups As Integer = 0
+        Dim namingWarnings As New System.Collections.Generic.List(Of String)()
+        Dim skippedDuplicates As Integer = 0
+        Dim newPoints As Integer = 0
+        Dim updatedGroups As Integer = 0
+        Dim newGroups As Integer = 0
+        Dim plateBody As Inventor.SurfaceBody = plateNativeFace.SurfaceBody
+        Dim preparationIndex As Integer = 0
+        For Each g As OutputGroup In desiredGroups.Values
+            preparationIndex += 1
+            operationInfo = "Preparing group " & preparationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
+            MGHProgressMessage(progress, app, operationInfo)
+            If existing.ContainsKey(g.Key) Then
+                Dim feat As Inventor.HoleFeature = existing(g.Key)
+                If g.Mode = "Threaded" Then
+                    If Not feat.Tapped Then Throw New System.Exception("Existing group should be threaded but is not: " & feat.Name)
+                    Dim storedTap As Inventor.HoleTapInfo = TryCast(feat.TapInfo, Inventor.HoleTapInfo)
+                    If storedTap Is Nothing OrElse Not String.Equals(storedTap.ThreadDesignation, g.ThreadDesignation, System.StringComparison.OrdinalIgnoreCase) Then
+                        Throw New System.Exception("Existing group thread designation differs: " & feat.Name)
+                    End If
+                ElseIf feat.HoleDiameter IsNot Nothing Then
+                    If Not (g.Mode = "Clearance" AndAlso feat.IsClearanceHole) AndAlso _
+                       System.Math.Abs(feat.HoleDiameter.Value - g.DiameterIn * 2.54) > 0.0002 Then
+                        Throw New System.Exception("Existing group diameter differs: " & feat.Name & ". Check the feature and specifications.")
+                    End If
+                End If
+                If g.Seat = "Countersink" Then MGHEnforceCountersink(feat, g)
+                MGHCheckExistingSeat(feat, g)
+                Dim pd As Inventor.SketchHolePlacementDefinition = TryCast(feat.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
+                If pd Is Nothing Then Throw New System.Exception("Existing matching feature is no longer sketch-based: " & feat.Name)
+                Dim existingSketch As Inventor.PlanarSketch = feat.Sketch
+                Dim pendingCenters As New System.Collections.Generic.List(Of Inventor.Point)()
+                For Each p As Inventor.Point In g.Centers
+                    Dim p2 As Inventor.Point2d = existingSketch.ModelToSketchSpace(p)
+                    Dim found As Boolean = False
+                    For Each sp As Inventor.SketchPoint In pd.HoleCenterPoints
+                        If sp.Geometry.DistanceTo(p2) < 0.005 Then
+                            found = True
+                            Exit For
+                        End If
+                    Next
+                    If Not found Then pendingCenters.Add(p)
+                Next
+                If pendingCenters.Count > 0 Then
+                    operationInfo = "Determining plate interior for existing group: " & g.Label
+                    inwardDirections.Add(g.Key, DetermineInwardDirection(existingSketch, plateBody, pendingCenters, app))
+                    interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(existingSketch, plateBody, pendingCenters, app))
+                Else
+                    ' Selected centers belonging to a previous outward-facing feature
+                    ' may still have solid material beneath them. Test each center:
+                    ' some centers might already be drilled and should be ignored.
+                    Dim repairCenters As New System.Collections.Generic.List(Of Inventor.Point)()
+                    For Each center As Inventor.Point In g.Centers
+                        Try
+                            Dim one As New System.Collections.Generic.List(Of Inventor.Point)()
+                            one.Add(center)
+                            MGHFindInteriorSamples(existingSketch, plateBody, one, app)
+                            repairCenters.Add(center)
+                        Catch
+                            ' This point is already open / has no material to cut.
+                        End Try
+                    Next
+                    If repairCenters.Count > 0 Then
+                        inwardDirections.Add(g.Key, DetermineInwardDirection(existingSketch, plateBody, repairCenters, app))
+                        interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(existingSketch, plateBody, repairCenters, app))
+                    End If
+                End If
+            Else
+                operationInfo = "Creating sketch for group: " & g.Label
+                Dim sk As Inventor.PlanarSketch = plateDef.Sketches.Add(plateNativeFace, False)
+                newSketches.Add(g.Key, sk)
+                newCenters.Add(g.Key, app.TransientObjects.CreateObjectCollection())
+                ' Never rename in this preparation loop. On some assemblies
+                ' PlanarSketch.Name raises E_FAIL (e.g. name collision).
+                operationInfo = "Determining plate interior for new group: " & g.Label
+                inwardDirections.Add(g.Key, DetermineInwardDirection(sk, plateBody, g.Centers, app))
+                interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(sk, plateBody, g.Centers, app))
+            End If
+            MGHProgressTick(progress, app, "Prepared group " & preparationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label)
+        Next
+
+        ' Each new specification uses ONE sketch with all its center points,
+        ' feeding ONE native part Hole feature.
+        Dim generationIndex As Integer = 0
+        For Each g As OutputGroup In desiredGroups.Values
+            generationIndex += 1
+            If existing.ContainsKey(g.Key) Then Continue For
+            operationInfo = "Building new group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
+            MGHProgressMessage(progress, app, operationInfo)
+            Dim sk As Inventor.PlanarSketch = newSketches(g.Key)
+            Dim pts As Inventor.ObjectCollection = newCenters(g.Key)
+            Dim addedInGroup As Integer = 0
+            For Each p As Inventor.Point In g.Centers
+                Dim p2 As Inventor.Point2d = sk.ModelToSketchSpace(p)
+                Dim sp As Inventor.SketchPoint = sk.SketchPoints.Add(p2, True)
+                sk.GeometricConstraints.AddGround(sp)
+                pts.Add(sp)
+                newPoints += 1
+                addedInGroup += 1
+                MGHProgressTick(progress, app, "Group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & _
+                    ": " & g.Label & " - point " & addedInGroup.ToString() & "/" & g.Centers.Count.ToString())
+            Next
+            operationInfo = "Drilling and verifying " & g.Label
+            MGHProgressMessage(progress, app, operationInfo)
+            Dim place As Inventor.SketchHolePlacementDefinition = holes.CreateSketchPlacementDefinition(pts)
+            Dim h As Inventor.HoleFeature = MGHCreateGroupedFeature(holes, place, g, inwardDirections(g.Key))
+            If h Is Nothing Then Throw New System.Exception("Inventor returned no Hole feature for " & g.Label)
+            ' Do NOT trust a successful API call: a feature can face away from the plate.
+            operationInfo = "Verifying through-all cut: " & g.Label
+            MGHProgressMessage(progress, app, operationInfo)
+            If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
+                flippedGroups += 1
+            End If
+            ' Feature metadata is authoritative for adding holes on subsequent runs;
+            ' the display names are best-effort conveniences.
+            operationInfo = "Recording group identity: " & g.Label
+            Dim aset As Inventor.AttributeSet = h.AttributeSets.Add("MGH_Generator")
+            aset.Add("GroupKey", Inventor.ValueTypeEnum.kStringType, g.Key)
+            operationInfo = "Labeling created group: " & g.Label
+            Dim specificationTag As String = If(g.Mode="Threaded", g.ThreadDesignation, _
+                "D" & g.DiameterIn.ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture))
+            Try
+                h.Name = UniqueHoleName(holes, "MGH - " & CleanName(g.Label) & " - " & specificationTag, h)
+            Catch renameEx As System.Exception
+                namingWarnings.Add("Hole feature for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
+            End Try
+            Try
+                sk.Name = UniqueSketchName(plateDef, "MGH Sketch - " & CleanName(g.Label) & " - " & specificationTag, sk)
+            Catch renameEx As System.Exception
+                namingWarnings.Add("Sketch for '" & g.Label & "' kept its Inventor default name (" & renameEx.Message & ").")
+            End Try
+            newGroups += 1
+            MGHProgressTick(progress, app, "New group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & " completed: " & g.Label)
+        Next
+
+        ' Extend existing matching groups, and ensure their Through All direction
+        ' points INTO the plate at the newly requested hole location.
+        generationIndex = 0
+        For Each g As OutputGroup In desiredGroups.Values
+            generationIndex += 1
+            If Not existing.ContainsKey(g.Key) Then Continue For
+            operationInfo = "Checking existing group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
+            MGHProgressMessage(progress, app, operationInfo)
+            Dim h As Inventor.HoleFeature = existing(g.Key)
+            Dim placement As Inventor.SketchHolePlacementDefinition = CType(h.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
+            Dim sk As Inventor.PlanarSketch = h.Sketch
+            Dim allPts As Inventor.ObjectCollection = app.TransientObjects.CreateObjectCollection()
+            For Each p As Inventor.SketchPoint In placement.HoleCenterPoints
+                allPts.Add(p)
+            Next
+            Dim changed As Boolean = False
+            Dim checkedInGroup As Integer = 0
+            For Each p As Inventor.Point In g.Centers
+                checkedInGroup += 1
+                MGHProgressTick(progress, app, "Group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & _
+                    ": " & g.Label & " - checking point " & checkedInGroup.ToString() & "/" & g.Centers.Count.ToString())
+                Dim p2 As Inventor.Point2d = sk.ModelToSketchSpace(p)
+                Dim duplicate As Boolean = False
+                For Each existingPoint As Inventor.SketchPoint In placement.HoleCenterPoints
+                    If existingPoint.Geometry.DistanceTo(p2) < 0.005 Then
+                        duplicate = True
+                        Exit For
+                    End If
+                Next
+                If duplicate Then
+                    skippedDuplicates += 1
+                    Continue For
+                End If
+                Dim newSp As Inventor.SketchPoint = sk.SketchPoints.Add(p2, True)
+                sk.GeometricConstraints.AddGround(newSp)
+                allPts.Add(newSp)
+                changed = True
+                newPoints += 1
+            Next
+            If changed Then
+                placement.HoleCenterPoints = allPts
+            End If
+            ' If previously generated holes point into empty space, retry the group
+            ' even when no new centers were added.
+            If changed OrElse interiorTestPoints.ContainsKey(g.Key) Then
+                operationInfo = "Verifying / repairing existing group: " & g.Label
+                MGHProgressMessage(progress, app, operationInfo)
+                h.SetThroughAllExtent(inwardDirections(g.Key))
+                If migrateLegacy.ContainsKey(g.Key) Then
+                    operationInfo = "Upgrading legacy clearance association: " & g.Label
+                    MGHProgressMessage(progress, app, operationInfo)
+                    MGHApplyClearanceInfo(holes, h, g)
+                    h.AttributeSets.Item("MGH_Generator").Item("GroupKey").Value = g.Key
+                End If
+                If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
+                    flippedGroups += 1
+                End If
+                updatedGroups += 1
+            End If
+            If migrateLegacy.ContainsKey(g.Key) Then
+                If Not h.IsClearanceHole Then
+                    MGHApplyClearanceInfo(holes, h, g)
+                End If
+                h.AttributeSets.Item("MGH_Generator").Item("GroupKey").Value = g.Key
+            End If
+            MGHProgressTick(progress, app, "Existing group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & " checked: " & g.Label)
+        Next
+
+        operationInfo = "Final validation: recomputing the mounting plate"
+        MGHProgressMessage(progress, app, operationInfo)
+        If Not plateDoc.Update2(False) Then
+            Throw New System.Exception("Inventor reports one or more part features failed to recompute. " & _
+                "The transaction will be aborted; inspect the model/feature geometry.")
+        End If
+        ' Recompute can cause native clearance tables to restore countersink
+        ' dimensions. Reject the group if the saved model differs from user input.
+        operationInfo = "Confirming countersink diameters and included angles after recompute"
+        MGHProgressMessage(progress, app, operationInfo)
+        For Each checkFeat As Inventor.HoleFeature In holes
+            If checkFeat.AttributeSets.NameIsUsed("MGH_Generator") Then
+                Dim checkSet As Inventor.AttributeSet = checkFeat.AttributeSets.Item("MGH_Generator")
+                Dim checkKey As String = CStr(checkSet.Item("GroupKey").Value)
+                If desiredGroups.ContainsKey(checkKey) Then
+                    Dim requested As OutputGroup = desiredGroups(checkKey)
+                    If requested.Seat="Countersink" Then MGHAssertCountersink(checkFeat,requested)
+                End If
+            End If
+        Next
+        MGHProgressTick(progress, app, "Final model recompute and countersink dimensions passed")
+        operationInfo = "Committing the plate transaction"
+        MGHProgressMessage(progress, app, operationInfo)
+        trans.End()
+        trans = Nothing
+        MGHProgressTick(progress, app, "Finished - plate transaction committed")
+        If progress IsNot Nothing Then
+            progress.Close()
+            progress = Nothing
+        End If
+        System.Windows.Forms.MessageBox.Show( _
+            "Finished editing " & plateDoc.DisplayName & vbCrLf & _
+            "New groups/features: " & newGroups.ToString() & vbCrLf & _
+            "Existing groups extended/repaired: " & updatedGroups.ToString() & vbCrLf & _
+            "Groups whose cut direction was reversed: " & flippedGroups.ToString() & vbCrLf & _
+            "New hole centers: " & newPoints.ToString() & vbCrLf & _
+            "Duplicate centers skipped: " & skippedDuplicates.ToString() & vbCrLf & _
+            If(namingWarnings.Count = 0, "", vbCrLf & "Naming notes (geometry was created):" & vbCrLf & _
+                String.Join(vbCrLf, namingWarnings.ToArray()) & vbCrLf) & vbCrLf & _
+            "Inspect the plate, dimensions, and hardware clearances, then SAVE the plate .ipt and assembly.", _
+            "Grouped Mounting Holes")
+    Catch ex As System.Exception
+        If progress IsNot Nothing Then
+            Try
+                progress.Close()
+            Catch
+            End Try
+            progress = Nothing
+        End If
+        If trans IsNot Nothing Then
+            Try
+                trans.Abort()
+            Catch
+            End Try
+        End If
+        System.Windows.Forms.MessageBox.Show( _
+            "Hole creation failed; attempted to roll back the group transaction." & vbCrLf & _
+            "Operation: " & operationInfo & vbCrLf & vbCrLf & _
+            ex.ToString(), "Grouped Mounting Holes - error")
+    End Try
+End Sub
+
+
+' ================================================================
+' INVENTOR 2027 INTERACTIVE SELECTION
+' InteractionEvents, unlike CommandManager.Pick, provides an explicit
+' Finish Selection / Cancel workflow without depending on ESC.
+' Autodesk API: InteractionEvents.SelectEvents.OnSelect.
+' ================================================================
+Public Class MGHInteractionSelector
+    Private WithEvents oInteraction As Inventor.InteractionEvents
+    Private WithEvents oSelect As Inventor.SelectEvents
+    Private palette As MGHSelectionPalette
+    Private completed As Boolean
+    Private approved As Boolean
+    Private automaticFinish As Boolean
+    Private highlightSet As Inventor.HighlightSet
+    Private highlightRims As Boolean
+    Public Picked As New System.Collections.Generic.List(Of Object)()
+
+    Public Function Run(app As Inventor.Application, _
+                        filter As Inventor.SelectionFilterEnum, _
+                        caption As String, instructions As String, _
+                        finishAfterFirst As Boolean) As Boolean
+        Picked.Clear()
+        completed = False
+        approved = False
+        automaticFinish = finishAfterFirst
+        highlightRims = Not finishAfterFirst
+        highlightSet = Nothing
+        Try
+            palette = New MGHSelectionPalette(caption, instructions, finishAfterFirst)
+            AddHandler palette.FinishPressed, AddressOf UserFinished
+            AddHandler palette.CancelPressed, AddressOf UserCanceled
+            AddHandler palette.FormClosed, AddressOf PaletteClosed
+
+            oInteraction = app.CommandManager.CreateInteractionEvents()
+            oInteraction.InteractionDisabled = False
+            oInteraction.StatusBarText = instructions
+            oSelect = oInteraction.SelectEvents
+            oSelect.AddSelectionFilter(filter)
+            oSelect.SingleSelectEnabled = finishAfterFirst
+
+            ' Keep ALL selected hole rims visibly highlighted during the session.
+            ' HighlightSet is supported in assembly documents and works with proxies.
+            If highlightRims Then
+                Try
+                    Dim assyDoc As Inventor.AssemblyDocument = TryCast(app.ActiveDocument, Inventor.AssemblyDocument)
+                    If assyDoc IsNot Nothing Then
+                        highlightSet = assyDoc.CreateHighlightSet()
+                        highlightSet.Color = app.TransientObjects.CreateColor(0, 220, 255)
+                    End If
+                Catch
+                    ' If Inventor cannot highlight a particular document/context,
+                    ' selection and hole creation must still work.
+                    highlightSet = Nothing
+                End Try
+            End If
+
+            palette.Show()  ' Modeless: user continues clicking Inventor geometry.
+            oInteraction.Start()
+            Do While Not completed
+                app.UserInterfaceManager.DoEvents()
+                ' Maintain message pumping in Inventor's own STA thread.
+                System.Threading.Thread.Sleep(12)
+            Loop
+            Return approved
+        Catch ex As System.Exception
+            System.Windows.Forms.MessageBox.Show( _
+                "Selection could not be completed:" & vbCrLf & ex.Message, _
+                "Grouped Mounting Holes - selection error")
+            Return False
+        Finally
+            completed = True
+            If oInteraction IsNot Nothing Then
+                Try
+                    oInteraction.Stop()
+                Catch
+                End Try
+            End If
+            oSelect = Nothing
+            oInteraction = Nothing
+            If highlightSet IsNot Nothing Then
+                Try
+                    highlightSet.Clear()
+                    highlightSet.Delete()
+                Catch
+                End Try
+                highlightSet = Nothing
+            End If
+            If palette IsNot Nothing Then
+                Try
+                    palette.Close()
+                    palette.Dispose()
+                Catch
+                End Try
+                palette = Nothing
+            End If
+        End Try
+    End Function
+
+    Private Sub SelectedGeometry(JustSelectedEntities As Inventor.ObjectsEnumerator, _
+        SelectionDevice As Inventor.SelectionDeviceEnum, _
+        ModelPosition As Inventor.Point, ViewPosition As Inventor.Point2d, _
+        View As Inventor.View) Handles oSelect.OnSelect
+        If completed Then Exit Sub
+        ' Use JustSelectedEntities directly: the event can fire before the
+        ' SelectedEntities collection is fully refreshed in some versions.
+        For Each ent As Object In JustSelectedEntities
+            If ent IsNot Nothing Then Picked.Add(ent)
+        Next
+        RefreshRimHighlight()
+        If palette IsNot Nothing Then palette.SetSelectedCount(Picked.Count)
+        If automaticFinish AndAlso Picked.Count > 0 Then
+            approved = True
+            completed = True
+        End If
+    End Sub
+
+    Private Sub UnselectedGeometry(UnSelectedEntities As Inventor.ObjectsEnumerator, _
+        SelectionDevice As Inventor.SelectionDeviceEnum, _
+        ModelPosition As Inventor.Point, ViewPosition As Inventor.Point2d, _
+        View As Inventor.View) Handles oSelect.OnUnSelect
+        If Not completed Then RefreshSelectedEntities()
+    End Sub
+
+    Private Sub RefreshSelectedEntities()
+        If oSelect Is Nothing Then Exit Sub
+        Picked.Clear()
+        Try
+            For Each ent As Object In oSelect.SelectedEntities
+                If ent IsNot Nothing Then Picked.Add(ent)
+            Next
+        Catch
+            ' OnSelect's JustSelectedEntities fallback remains available.
+        End Try
+        RefreshRimHighlight()
+        If palette IsNot Nothing Then palette.SetSelectedCount(Picked.Count)
+    End Sub
+
+    Private Sub RefreshRimHighlight()
+        If highlightSet Is Nothing Then Exit Sub
+        Try
+            highlightSet.Clear()
+            For Each ent As Object In Picked
+                Try
+                    Dim face As Inventor.FaceProxy = TryCast(ent, Inventor.FaceProxy)
+                    If face Is Nothing Then
+                        ' If user selects an edge, highlight that exact rim.
+                        highlightSet.AddItem(ent)
+                    Else
+                        ' If user selects a cylindrical bore wall, highlight
+                        ' the circular bounding rims, not the entire bore wall.
+                        Dim foundRims As Boolean = False
+                        For Each e As Object In face.Edges
+                            Try
+                                Dim rim As Inventor.EdgeProxy = TryCast(e, Inventor.EdgeProxy)
+                                If rim IsNot Nothing AndAlso TypeOf rim.Geometry Is Inventor.Circle Then
+                                    highlightSet.AddItem(rim)
+                                    foundRims = True
+                                End If
+                            Catch
+                            End Try
+                        Next
+                        If Not foundRims Then highlightSet.AddItem(face)
+                    End If
+                Catch
+                    ' A single unhighlightable rim must not cancel the tool.
+                End Try
+            Next
+        Catch
+        End Try
+    End Sub
+
+    Private Sub InteractionTerminated() Handles oInteraction.OnTerminate
+        ' Esc or a competing Inventor command should never hang the rule.
+        ' Explicit Finish button is the normal way to proceed.
+        If Not completed Then
+            approved = False
+            completed = True
+        End If
+    End Sub
+
+    Private Sub UserFinished(sender As Object, e As System.EventArgs)
+        If Picked.Count = 0 Then
+            System.Windows.Forms.MessageBox.Show( _
+                "Select at least one mounting hole before finishing, or click Cancel.", _
+                "No holes selected")
+            Exit Sub
+        End If
+        approved = True
+        completed = True
+    End Sub
+
+    Private Sub UserCanceled(sender As Object, e As System.EventArgs)
+        approved = False
+        completed = True
+    End Sub
+
+    Private Sub PaletteClosed(sender As Object, e As System.Windows.Forms.FormClosedEventArgs)
+        If Not completed Then
+            approved = False
+            completed = True
+        End If
+    End Sub
+End Class
+
+Public Class MGHSelectionPalette
+    Inherits System.Windows.Forms.Form
+
+    Public Event FinishPressed As System.EventHandler
+    Public Event CancelPressed As System.EventHandler
+    Private countLabel As System.Windows.Forms.Label
+
+    Public Sub New(caption As String, instructions As String, singlePick As Boolean)
+        MyBase.New()
+        Me.Text = caption
+        Me.Width = 475
+        Me.Height = 215
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedToolWindow
+        Me.TopMost = True
+        Me.ShowInTaskbar = False
+        Me.MaximizeBox = False
+        Me.MinimizeBox = False
+
+        Dim directions As New System.Windows.Forms.Label()
+        directions.Text = instructions
+        directions.Left = 14 : directions.Top = 14
+        directions.Width = 440 : directions.Height = 65
+        Me.Controls.Add(directions)
+
+        countLabel = New System.Windows.Forms.Label()
+        countLabel.Left = 14 : countLabel.Top = 84
+        countLabel.Width = 430 : countLabel.Height = 24
+        countLabel.Text = "Selected: 0 (cyan = selected hole rim)"
+        Me.Controls.Add(countLabel)
+
+        Dim cancelBtn As New System.Windows.Forms.Button()
+        cancelBtn.Text = "Cancel Without Changes"
+        cancelBtn.Width = 165 : cancelBtn.Left = 14 : cancelBtn.Top = 117
+        AddHandler cancelBtn.Click, AddressOf CancelClick
+        Me.Controls.Add(cancelBtn)
+
+        If Not singlePick Then
+            Dim finishBtn As New System.Windows.Forms.Button()
+            finishBtn.Text = "Finish Selection && Review"
+            finishBtn.Width = 190 : finishBtn.Left = 265 : finishBtn.Top = 117
+            AddHandler finishBtn.Click, AddressOf FinishClick
+            Me.Controls.Add(finishBtn)
+        End If
+        ' Do NOT set Form.AcceptButton or Form.CancelButton: in Inventor
+        ' 2027 iLogic those assignments can invoke System.Private.Windows.Core.
+    End Sub
+
+    Public Sub SetSelectedCount(n As Integer)
+        countLabel.Text = "Selected: " & n.ToString()
+    End Sub
+
+    Private Sub FinishClick(sender As Object, e As System.EventArgs)
+        RaiseEvent FinishPressed(Me, System.EventArgs.Empty)
+    End Sub
+
+    Private Sub CancelClick(sender As Object, e As System.EventArgs)
+        RaiseEvent CancelPressed(Me, System.EventArgs.Empty)
+    End Sub
+End Class
+
+Public Class MGHModeDialog
+    Inherits System.Windows.Forms.Form
+
+    Public Sub New()
+        MyBase.New()
+        Me.Text = "How do you want to select mounting holes?"
+        Me.Width = 585 : Me.Height = 245
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.MaximizeBox = False : Me.MinimizeBox = False
+        Dim note As New System.Windows.Forms.Label()
+        note.Left = 14 : note.Top = 16 : note.Width = 545 : note.Height = 75
+        note.Text = "Choose which geometry you will click on the mounted components." & _
+            vbCrLf & "You can select many holes, then click FINISH SELECTION & REVIEW."
+        Me.Controls.Add(note)
+
+        Dim rim As New System.Windows.Forms.Button()
+        rim.Text = "Select Circular Hole Edges"
+        rim.Left = 14 : rim.Top = 103 : rim.Width = 255 : rim.Height = 40
+        AddHandler rim.Click, AddressOf ChooseRims
+        Me.Controls.Add(rim)
+
+        Dim wall As New System.Windows.Forms.Button()
+        wall.Text = "Select Cylindrical Hole Faces"
+        wall.Left = 284 : wall.Top = 103 : wall.Width = 275 : wall.Height = 40
+        AddHandler wall.Click, AddressOf ChooseWalls
+        Me.Controls.Add(wall)
+
+        Dim cancel As New System.Windows.Forms.Button()
+        cancel.Text = "Cancel Without Changes"
+        cancel.Left = 375 : cancel.Top = 154 : cancel.Width = 184 : cancel.Height = 30
+        AddHandler cancel.Click, AddressOf ChooseCancel
+        Me.Controls.Add(cancel)
+    End Sub
+
+    Private Sub ChooseRims(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.Yes
+        Me.Close()
+    End Sub
+    Private Sub ChooseWalls(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.No
+        Me.Close()
+    End Sub
+    Private Sub ChooseCancel(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
+        Me.Close()
+    End Sub
+End Class
+
+Public Class MGHGenerateDialog
+    Inherits System.Windows.Forms.Form
+
+    Public Sub New(message As String)
+        MyBase.New()
+        Me.Text = "Verify Mounting Holes Before Generating"
+        Me.Width = 660 : Me.Height = 530
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable
+        Me.MinimizeBox = False
+
+        Dim reviewText As New System.Windows.Forms.TextBox()
+        reviewText.Left = 12 : reviewText.Top = 12
+        reviewText.Width = 620 : reviewText.Height = 410
+        reviewText.Multiline = True
+        reviewText.ScrollBars = System.Windows.Forms.ScrollBars.Vertical
+        reviewText.ReadOnly = True
+        reviewText.Text = message
+        reviewText.Anchor = System.Windows.Forms.AnchorStyles.Top Or _
+            System.Windows.Forms.AnchorStyles.Bottom Or _
+            System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
+        Me.Controls.Add(reviewText)
+
+        Dim goBtn As New System.Windows.Forms.Button()
+        goBtn.Text = "Generate Holes"
+        goBtn.Width = 155 : goBtn.Top = 437 : goBtn.Left = 478
+        goBtn.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
+        AddHandler goBtn.Click, AddressOf GenerateClick
+        Me.Controls.Add(goBtn)
+
+        Dim cancelBtn As New System.Windows.Forms.Button()
+        cancelBtn.Text = "Cancel Without Changes"
+        cancelBtn.Width = 170 : cancelBtn.Top = 437 : cancelBtn.Left = 297
+        cancelBtn.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
+        AddHandler cancelBtn.Click, AddressOf CancelClick
+        Me.Controls.Add(cancelBtn)
+    End Sub
+
+    Private Sub GenerateClick(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.OK
+        Me.Close()
+    End Sub
+    Private Sub CancelClick(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
+        Me.Close()
+    End Sub
+End Class
+
+Public Class MountPoint
+    Public Center As Inventor.Point
+    Public SourceDiameterIn As Double
+    Public SourceName As String
+End Class
+
+Public Class InputBucket
+    Public SourceKey As String
+    Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
+    Public Screw As String
+    Public Fit As String
+    Public DiameterIn As Double
+    Public GroupLabel As String
+    Public Mode As String = "Clearance"
+    Public Seat As String = "None"
+    Public SeatDiameterIn As Double = 0
+    Public SeatDepthIn As Double = 0
+    Public SeatAngleDeg As Double = 0
+    Public ThreadType As String = "ANSI Unified Screw Threads"
+    Public ThreadDesignation As String = ""
+    Public ThreadClass As String = "2B"
+    Public ClearanceStandard As String = "Ansi Unified Screw Threads"
+    Public ClearanceFamily As String = "Flat Head Machine Screw (100)"
+End Class
+
+Public Class OutputGroup
+    Public Key As String
+    Public Label As String
+    Public DiameterIn As Double
+    Public Screw As String
+    Public Fit As String
+    Public Mode As String
+    Public Seat As String
+    Public SeatDiameterIn As Double
+    Public SeatDepthIn As Double
+    Public SeatAngleDeg As Double
+    Public ThreadType As String
+    Public ThreadDesignation As String
+    Public ThreadClass As String
+    Public ClearanceStandard As String
+    Public ClearanceFamily As String
+    Public LegacyKey As String
+    Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
+End Class
+
+
+Function MGHDefaultThread(size As String) As String
+    Select Case size
+        Case "#0" : Return "0-80 UNF"
+        Case "#1" : Return "1-64 UNC"
+        Case "#2" : Return "2-56 UNC"
+        Case "#3" : Return "3-48 UNC"
+        Case "#4" : Return "4-40 UNC"
+        Case "#5" : Return "5-40 UNC"
+        Case "#6" : Return "6-32 UNC"
+        Case "#7" : Return "7-32 UNC"
+        Case "#8" : Return "8-32 UNC"
+        Case "#9" : Return "9-24 UNC"
+        Case "#10" : Return "10-24 UNC"
+        Case "#11" : Return "11-24 UNC"
+        Case "#12" : Return "12-24 UNC"
+        Case "1/4" : Return "1/4-20 UNC"
+        Case Else : Return ""
+    End Select
+End Function
+
+Function MGHThreadNominalFromDesignation(designation As String) As Double
+    Dim textValue As String=designation.Trim().ToUpperInvariant().Replace("#", "")
+    If textValue.StartsWith("M") Then
+        Dim token As String=textValue.Substring(1).Split("X"c)(0)
+        Dim mm As Double=0
+        If Double.TryParse(token,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,mm) Then Return mm/25.4
+    Else
+        Dim token As String=textValue.Split("-"c)(0)
+        If token.Contains("/") Then
+            Dim fraction As String()=token.Split("/"c)
+            Dim numerator As Double=0, denominator As Double=0
+            If fraction.Length=2 AndAlso _
+               Double.TryParse(fraction(0),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,numerator) AndAlso _
+               Double.TryParse(fraction(1),System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,denominator) AndAlso denominator>0 Then
+                Return numerator/denominator
+            End If
+        Else
+            Dim gauge As Integer=0
+            If Integer.TryParse(token,gauge) AndAlso gauge>=0 AndAlso gauge<=12 Then
+                Return 0.060+0.013*gauge
+            End If
+        End If
+    End If
+    Return 0.0
+End Function
+
+Function MGHThreadNominalDiameter(size As String) As Double
+    Select Case size
+        Case "#0": Return 0.060
+        Case "#1": Return 0.073
+        Case "#2": Return 0.086
+        Case "#3": Return 0.099
+        Case "#4": Return 0.112
+        Case "#5": Return 0.125
+        Case "#6": Return 0.138
+        Case "#7": Return 0.151
+        Case "#8": Return 0.164
+        Case "#9": Return 0.177
+        Case "#10": Return 0.190
+        Case "#11": Return 0.203
+        Case "#12": Return 0.216
+        Case "1/4": Return 0.250
+    End Select
+    Return 0
+End Function
+
+Function MGHFitEnum(fit As String) As Inventor.FastenerFitType
+    Select Case fit
+        Case "Close" : Return Inventor.FastenerFitType.kCloseFitType
+        Case "Loose" : Return Inventor.FastenerFitType.kLooseFitType
+        Case Else : Return Inventor.FastenerFitType.kNormalFitType
+    End Select
+End Function
+
+Sub MGHApplyClearanceInfo(holes As Inventor.HoleFeatures,h As Inventor.HoleFeature,g As OutputGroup)
+    Try
+        Dim ci As Inventor.HoleClearanceInfo=holes.CreateClearanceInfo(g.ClearanceStandard,g.ClearanceFamily,g.Screw,MGHFitEnum(g.Fit))
+        h.ClearanceInfo=ci
+        If Not h.IsClearanceHole Then Throw New System.Exception("Inventor did not mark it as a clearance hole.")
+    Catch ex As System.Exception
+        Throw New System.Exception("Native clearance could not be resolved from the installed Clearance.xls: " & g.Screw & " " & g.Fit & ". " & _
+            "Switch this row to Custom/Press-Fit if an exact diameter-only hole is required. Details: " & ex.Message)
+    End Try
+End Sub
+
+Function MGHCreateGroupedFeature(holes As Inventor.HoleFeatures,place As Inventor.SketchHolePlacementDefinition, _
+    g As OutputGroup,direction As Inventor.PartFeatureExtentDirectionEnum) As Inventor.HoleFeature
+    Dim diaInfo As Object=Nothing
+    If g.Mode="Threaded" Then
+        Try
+            diaInfo=holes.CreateTapInfo(True,g.ThreadType,g.ThreadDesignation,g.ThreadClass,True)
+        Catch ex As System.Exception
+            Throw New System.Exception("Thread spec not found in local Thread.xls for " & g.Label & _
+                ": " & g.ThreadType & " / " & g.ThreadDesignation & " / " & g.ThreadClass & ". " & ex.Message)
+        End Try
+    Else
+        diaInfo=g.DiameterIn.ToString("0.000000",System.Globalization.CultureInfo.InvariantCulture) & " in"
+    End If
+    Dim h As Inventor.HoleFeature=Nothing
+    Dim seatDia As String=g.SeatDiameterIn.ToString("0.000000",System.Globalization.CultureInfo.InvariantCulture) & " in"
+    Select Case g.Seat
+        Case "None"
+            h=holes.AddDrilledByThroughAllExtent(place,diaInfo,direction)
+        Case "Counterbore"
+            h=holes.AddCBoreByThroughAllExtent(place,diaInfo,direction,seatDia, _
+                g.SeatDepthIn.ToString("0.000000",System.Globalization.CultureInfo.InvariantCulture) & " in")
+        Case "Countersink"
+            h=holes.AddCSinkByThroughAllExtent(place,diaInfo,direction,seatDia, _
+                g.SeatAngleDeg.ToString("0.0000",System.Globalization.CultureInfo.InvariantCulture) & " deg")
+        Case "Spotface"
+            h=holes.AddSpotFaceByThroughAllExtent(place,diaInfo,direction,seatDia, _
+                g.SeatDepthIn.ToString("0.000000",System.Globalization.CultureInfo.InvariantCulture) & " in")
+        Case Else
+            Throw New System.Exception("Unrecognized seat: " & g.Seat)
+    End Select
+    If h Is Nothing Then Throw New System.Exception("Inventor did not return a hole feature for " & g.Label)
+    If g.Mode="Clearance" Then MGHApplyClearanceInfo(holes,h,g)
+    If g.Seat="Countersink" Then MGHEnforceCountersink(h,g)
+    Return h
+End Function
+
+
+' Inventor may replace user-entered seat dimensions when ClearanceInfo is applied.
+' Make explicit dimensions authoritative. Inventor API works in cm and radians;
+' using unit-qualified expressions avoids locale/document-unit ambiguity.
+Sub MGHEnforceCountersink(h As Inventor.HoleFeature,g As OutputGroup)
+    If g.Seat<>"Countersink" Then Return
+    If h.HoleType<>Inventor.HoleTypeEnum.kCounterSinkHole Then
+        Throw New System.Exception("Feature is not a countersink: " & g.Label)
+    End If
+    Try
+        Dim desiredDiameterCm As Double = g.SeatDiameterIn * 2.54
+        Dim desiredAngleRad As Double = g.SeatAngleDeg * System.Math.PI / 180.0
+        If h.CSinkDiameter Is Nothing OrElse h.CSinkAngle Is Nothing Then
+            Throw New System.Exception("Inventor did not expose countersink size parameters.")
+        End If
+        If System.Math.Abs(h.CSinkDiameter.ModelValue-desiredDiameterCm)>0.00002 Then
+            h.CSinkDiameter.Expression = g.SeatDiameterIn.ToString("0.000000", _
+                System.Globalization.CultureInfo.InvariantCulture) & " in"
+        End If
+        If System.Math.Abs(h.CSinkAngle.ModelValue-desiredAngleRad)>0.00001 Then
+            h.CSinkAngle.Expression = g.SeatAngleDeg.ToString("0.0000", _
+                System.Globalization.CultureInfo.InvariantCulture) & " deg"
+        End If
+    Catch ex As System.Exception
+        Throw New System.Exception("Inventor would not retain the requested countersink dimensions for '" & _
+            g.Label & "'. The local clearance table may lock the seat dimensions. " & _
+            "Try hole type Custom/Press-Fit for exact, dimension-driven geometry. " & _
+            "The transaction will be rolled back; no incorrect countersink is accepted. Details: " & ex.Message, ex)
+    End Try
+    MGHAssertCountersink(h,g)
+End Sub
+
+' Must be used AFTER final document recompute, not just immediately after creation.
+Sub MGHAssertCountersink(h As Inventor.HoleFeature,g As OutputGroup)
+    If g.Seat<>"Countersink" Then Return
+    If h.HoleType<>Inventor.HoleTypeEnum.kCounterSinkHole Then
+        Throw New System.Exception("Countersink type changed unexpectedly: " & g.Label)
+    End If
+    Dim actualDia As Double = h.CSinkDiameter.ModelValue / 2.54
+    Dim actualDeg As Double = h.CSinkAngle.ModelValue * 180.0 / System.Math.PI
+    If System.Math.Abs(actualDia-g.SeatDiameterIn)>0.00001 OrElse _
+       System.Math.Abs(actualDeg-g.SeatAngleDeg)>0.001 Then
+        Throw New System.Exception("Countersink size mismatch for '" & g.Label & "': requested Ø" & _
+            g.SeatDiameterIn.ToString("0.0000",System.Globalization.CultureInfo.InvariantCulture) & _
+            " in × " & g.SeatAngleDeg.ToString("0.#",System.Globalization.CultureInfo.InvariantCulture) & _
+            "°, but Inventor holds Ø" & actualDia.ToString("0.0000",System.Globalization.CultureInfo.InvariantCulture) & _
+            " in × " & actualDeg.ToString("0.###",System.Globalization.CultureInfo.InvariantCulture) & _
+            "°. Transaction will be rolled back rather than retaining wrong geometry.")
+    End If
+End Sub
+
+Sub MGHCheckExistingSeat(h As Inventor.HoleFeature,g As OutputGroup)
+    Select Case g.Seat
+        Case "None"
+            If h.HoleType <> Inventor.HoleTypeEnum.kDrilledHole Then Throw New System.Exception("Existing feature seat changed: " & h.Name)
+        Case "Counterbore"
+            If h.HoleType <> Inventor.HoleTypeEnum.kCounterBoreHole Then Throw New System.Exception("Existing feature seat changed: " & h.Name)
+            If System.Math.Abs(h.CBoreDiameter.Value-g.SeatDiameterIn*2.54)>0.0002 OrElse _
+               System.Math.Abs(h.CBoreDepth.Value-g.SeatDepthIn*2.54)>0.0002 Then Throw New System.Exception("Counterbore dimensions changed: " & h.Name)
+        Case "Countersink"
+            If h.HoleType <> Inventor.HoleTypeEnum.kCounterSinkHole Then Throw New System.Exception("Existing feature seat changed: " & h.Name)
+            If System.Math.Abs(h.CSinkDiameter.Value-g.SeatDiameterIn*2.54)>0.0002 OrElse _
+               System.Math.Abs(h.CSinkAngle.Value-g.SeatAngleDeg*System.Math.PI/180.0)>0.0001 Then Throw New System.Exception("Countersink dimensions changed: " & h.Name)
+        Case "Spotface"
+            If h.HoleType <> Inventor.HoleTypeEnum.kSpotFaceHole Then Throw New System.Exception("Existing feature seat changed: " & h.Name)
+            If System.Math.Abs(h.SpotFaceDiameter.Value-g.SeatDiameterIn*2.54)>0.0002 OrElse _
+               System.Math.Abs(h.SpotFaceDepth.Value-g.SeatDepthIn*2.54)>0.0002 Then Throw New System.Exception("Spotface dimensions changed: " & h.Name)
+    End Select
+End Sub
+
+' Return the correct through-all direction by probing the actual solid on
+' both sides of the SKETCH normal. Sketch normal, not face/camera normal,
+' defines Inventor's positive-hole-extent direction.
+Function DetermineInwardDirection(sk As Inventor.PlanarSketch, _
+    body As Inventor.SurfaceBody, centers As System.Collections.Generic.List(Of Inventor.Point), _
+    app As Inventor.Application) As Inventor.PartFeatureExtentDirectionEnum
+
+    If body Is Nothing OrElse Not body.IsSolid Then
+        Throw New System.Exception("Selected plate face does not belong to a solid body.")
+    End If
+    If centers Is Nothing OrElse centers.Count = 0 Then
+        Throw New System.Exception("No new hole center is available to determine the cut direction.")
+    End If
+
+    ' Calculate a right-handed sketch normal using SketchToModelSpace.
+    ' The model's assembly placement, face choice and camera have no effect.
+    Dim t As Inventor.TransientGeometry = app.TransientGeometry
+    Dim p0 As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(0, 0))
+    Dim pX As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(1, 0))
+    Dim pY As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(0, 1))
+    Dim ax As Double = pX.X - p0.X
+    Dim ay As Double = pX.Y - p0.Y
+    Dim az As Double = pX.Z - p0.Z
+    Dim bx As Double = pY.X - p0.X
+    Dim by As Double = pY.Y - p0.Y
+    Dim bz As Double = pY.Z - p0.Z
+    Dim nx As Double = ay * bz - az * by
+    Dim ny As Double = az * bx - ax * bz
+    Dim nz As Double = ax * by - ay * bx
+    Dim mag As Double = System.Math.Sqrt(nx * nx + ny * ny + nz * nz)
+    If mag < 0.000000001 Then Throw New System.Exception("Could not calculate the sketch normal.")
+    nx /= mag : ny /= mag : nz /= mag
+
+    ' Units are cm (Inventor internal). These small tests accommodate thin plates.
+    ' All candidates are evaluated before drilling, so a new location should
+    ' have solid material immediately beneath the plate's mounting face.
+    Dim offsets() As Double = {0.002, 0.005, 0.015, 0.03}
+    For Each center As Inventor.Point In centers
+        For Each offsetCm As Double In offsets
+            Dim plus() As Double = {center.X + nx * offsetCm, center.Y + ny * offsetCm, center.Z + nz * offsetCm}
+            Dim minus() As Double = {center.X - nx * offsetCm, center.Y - ny * offsetCm, center.Z - nz * offsetCm}
+            Dim plusState As Inventor.ContainmentEnum = body.IsPointInside(plus, False)
+            Dim minusState As Inventor.ContainmentEnum = body.IsPointInside(minus, False)
+            If plusState = Inventor.ContainmentEnum.kInsideContainment AndAlso _
+               minusState <> Inventor.ContainmentEnum.kInsideContainment Then
+                Return Inventor.PartFeatureExtentDirectionEnum.kPositiveExtentDirection
+            End If
+            If minusState = Inventor.ContainmentEnum.kInsideContainment AndAlso _
+               plusState <> Inventor.ContainmentEnum.kInsideContainment Then
+                Return Inventor.PartFeatureExtentDirectionEnum.kNegativeExtentDirection
+            End If
+        Next
+    Next
+    Throw New System.Exception("Cannot determine which side of the selected sketch contains plate material. " & _
+        "The locations may already be drilled, lie on a cutout, or the selected face may not be on a simple solid plate. " & _
+        "No outward-directed holes will be created.")
+End Function
+
+
+' Show native Inventor progress, keeping the text descriptive even during a slow COM call.
+' AllowCancel is intentionally false: stopping mid-feature while a transaction is
+' in flight can leave inconsistent Inventor COM state. Normal errors abort the transaction.
+Sub MGHProgressMessage(pb As Inventor.ProgressBar, app As Inventor.Application, message As String)
+    If pb IsNot Nothing Then pb.Message = message
+    app.StatusBarText = message
+    app.UserInterfaceManager.DoEvents()
+End Sub
+
+Sub MGHProgressTick(pb As Inventor.ProgressBar, app As Inventor.Application, message As String)
+    If pb IsNot Nothing Then
+        pb.Message = message
+        pb.UpdateProgress()
+    End If
+    app.StatusBarText = message
+    app.UserInterfaceManager.DoEvents()
+End Sub
+
+' Work in centimeter model coordinates. Probe 0.02-0.30 mm beneath the plate
+' plane at every specified center BEFORE the hole feature is created.
+' These points must be inside material before cutting and outside afterward.
+Function MGHFindInteriorSamples(sk As Inventor.PlanarSketch, body As Inventor.SurfaceBody, _
+        centers As System.Collections.Generic.List(Of Inventor.Point), _
+        app As Inventor.Application) As System.Collections.Generic.List(Of Inventor.Point)
+    Dim t As Inventor.TransientGeometry = app.TransientGeometry
+    Dim p0 As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(0, 0))
+    Dim px As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(1, 0))
+    Dim py As Inventor.Point = sk.SketchToModelSpace(t.CreatePoint2d(0, 1))
+    Dim ux As Double = px.X - p0.X, uy As Double = px.Y - p0.Y, uz As Double = px.Z - p0.Z
+    Dim vx As Double = py.X - p0.X, vy As Double = py.Y - p0.Y, vz As Double = py.Z - p0.Z
+    Dim nx As Double = uy * vz - uz * vy
+    Dim ny As Double = uz * vx - ux * vz
+    Dim nz As Double = ux * vy - uy * vx
+    Dim magnitude As Double = System.Math.Sqrt(nx * nx + ny * ny + nz * nz)
+    If magnitude < 0.000000001 Then Throw New System.Exception("Could not calculate sketch normal for material verification.")
+    nx /= magnitude : ny /= magnitude : nz /= magnitude
+    Dim distances() As Double = {0.002, 0.005, 0.015, 0.03}
+    Dim result As New System.Collections.Generic.List(Of Inventor.Point)()
+    For Each center As Inventor.Point In centers
+        Dim found As Boolean = False
+        For Each offsetCm As Double In distances
+            Dim plusArray() As Double = {center.X + nx * offsetCm, center.Y + ny * offsetCm, center.Z + nz * offsetCm}
+            Dim minusArray() As Double = {center.X - nx * offsetCm, center.Y - ny * offsetCm, center.Z - nz * offsetCm}
+            Dim plusInside As Boolean = (body.IsPointInside(plusArray, False) = Inventor.ContainmentEnum.kInsideContainment)
+            Dim minusInside As Boolean = (body.IsPointInside(minusArray, False) = Inventor.ContainmentEnum.kInsideContainment)
+            If plusInside Xor minusInside Then
+                If plusInside Then
+                    result.Add(t.CreatePoint(plusArray(0), plusArray(1), plusArray(2)))
+                Else
+                    result.Add(t.CreatePoint(minusArray(0), minusArray(1), minusArray(2)))
+                End If
+                found = True
+                Exit For
+            End If
+        Next
+        If Not found Then
+            Throw New System.Exception("Cannot locate plate material under mounting hole at (" & _
+                center.X.ToString("0.000") & ", " & center.Y.ToString("0.000") & ", " & _
+                center.Z.ToString("0.000") & ") cm. Check the plate face and any existing holes.")
+        End If
+    Next
+    Return result
+End Function
+
+Function MGHStillSolid(def As Inventor.PartComponentDefinition, _
+    probePoints As System.Collections.Generic.List(Of Inventor.Point)) As Boolean
+    For Each point As Inventor.Point In probePoints
+        Dim xyz() As Double = {point.X, point.Y, point.Z}
+        For Each b As Inventor.SurfaceBody In def.SurfaceBodies
+            If b.IsSolid Then
+                If b.IsPointInside(xyz, False) = Inventor.ContainmentEnum.kInsideContainment Then
+                    Return True
+                End If
+            End If
+        Next
+    Next
+    Return False
+End Function
+
+Function MGHOppositeDirection(d As Inventor.PartFeatureExtentDirectionEnum) As Inventor.PartFeatureExtentDirectionEnum
+    If d = Inventor.PartFeatureExtentDirectionEnum.kPositiveExtentDirection Then
+        Return Inventor.PartFeatureExtentDirectionEnum.kNegativeExtentDirection
+    ElseIf d = Inventor.PartFeatureExtentDirectionEnum.kNegativeExtentDirection Then
+        Return Inventor.PartFeatureExtentDirectionEnum.kPositiveExtentDirection
+    End If
+    Throw New System.Exception("Hole cut direction was not positive or negative.")
+End Function
+
+' A successful HoleFeature call is NOT evidence that material was removed!
+' Confirm every sampled center is empty after model recompute. If not,
+' reverse the actual feature extent and check again; fail/rollback if still solid.
+Function MGHVerifyCutAndFlip(h As Inventor.HoleFeature, doc As Inventor.PartDocument, _
+    def As Inventor.PartComponentDefinition, _
+    samples As System.Collections.Generic.List(Of Inventor.Point), _
+    app As Inventor.Application, pb As Inventor.ProgressBar, groupLabel As String) As Boolean
+    If Not doc.Update2(False) Then
+        Throw New System.Exception("Part update failed while checking cut direction for '" & groupLabel & "'.")
+    End If
+    If Not MGHStillSolid(def, samples) Then Return False
+
+    MGHProgressMessage(pb, app, "First direction missed material - reversing " & groupLabel)
+    Dim currentExtent As Inventor.ThroughAllExtent = TryCast(h.Extent, Inventor.ThroughAllExtent)
+    If currentExtent Is Nothing Then Throw New System.Exception("Hole '" & groupLabel & "' did not have a Through All extent.")
+    h.SetThroughAllExtent(MGHOppositeDirection(currentExtent.Direction))
+    If Not doc.Update2(False) Then
+        Throw New System.Exception("Part update failed after reversing hole '" & groupLabel & "'.")
+    End If
+    If MGHStillSolid(def, samples) Then
+        Throw New System.Exception("Neither cut direction removed material at ALL selected positions for '" & _
+            groupLabel & "'. Transaction will be aborted; inspect the selected plate face and geometry.")
+    End If
+    Return True
+End Function
+
+' Sketch and feature names are not the identity of an MGH group; attributes are.
+' Make visible names collision-resistant. A rename failure is not fatal.
+Function UniqueSketchName(def As Inventor.PartComponentDefinition, requested As String, _
+    ownSketch As Inventor.PlanarSketch) As String
+    For n As Integer = 1 To 1000
+        Dim candidate As String = If(n = 1, requested, requested & " (" & n.ToString() & ")")
+        Dim exists As Boolean = False
+        For Each sk As Inventor.PlanarSketch In def.Sketches
+            If sk Is ownSketch Then Continue For
+            If String.Equals(sk.Name, candidate, System.StringComparison.OrdinalIgnoreCase) Then
+                exists = True
+                Exit For
+            End If
+        Next
+        If Not exists Then Return candidate
+    Next
+    Throw New System.Exception("Could not find an unused sketch name.")
+End Function
+
+Function UniqueHoleName(allHoles As Inventor.HoleFeatures, requested As String, _
+    ownHole As Inventor.HoleFeature) As String
+    For n As Integer = 1 To 1000
+        Dim candidate As String = If(n = 1, requested, requested & " (" & n.ToString() & ")")
+        Dim exists As Boolean = False
+        For Each hf As Inventor.HoleFeature In allHoles
+            If hf Is ownHole Then Continue For
+            If String.Equals(hf.Name, candidate, System.StringComparison.OrdinalIgnoreCase) Then
+                exists = True
+                Exit For
+            End If
+        Next
+        If Not exists Then Return candidate
+    Next
+    Throw New System.Exception("Could not find an unused Hole feature name.")
+End Function
+
+Function ProjectToPlane(p As Inventor.Point, pl As Inventor.Plane, app As Inventor.Application) As Inventor.Point
+    Dim n As Inventor.UnitVector = pl.Normal
+    Dim o As Inventor.Point = pl.RootPoint
+    Dim dist As Double = (p.X - o.X) * n.X + (p.Y - o.Y) * n.Y + (p.Z - o.Z) * n.Z
+    Return app.TransientGeometry.CreatePoint(p.X - dist * n.X, p.Y - dist * n.Y, p.Z - dist * n.Z)
+End Function
+
+Function StablePlaneKey(pl As Inventor.Plane) As String
+    Dim n As Inventor.UnitVector = pl.Normal
+    Dim nx As Double = n.X, ny As Double = n.Y, nz As Double = n.Z
+    If System.Math.Abs(nx) > 0.000001 Then
+        If nx < 0 Then nx = -nx : ny = -ny : nz = -nz
+    ElseIf System.Math.Abs(ny) > 0.000001 Then
+        If ny < 0 Then nx = -nx : ny = -ny : nz = -nz
+    ElseIf nz < 0 Then
+        nx = -nx : ny = -ny : nz = -nz
+    End If
+    Dim o As Inventor.Point = pl.RootPoint
+    Dim dist As Double = nx * o.X + ny * o.Y + nz * o.Z
+    Return "PLANE:" & FmtKey(nx) & "," & FmtKey(ny) & "," & FmtKey(nz) & "," & FmtKey(dist)
+End Function
+
+Function FmtKey(x As Double) As String
+    Return x.ToString("0.00000", System.Globalization.CultureInfo.InvariantCulture)
+End Function
+
+Function CleanName(s As String) As String
+    Dim r As String = s.Trim()
+    For Each c As Char In New Char() {"/"c, "\"c, ":"c, "*"c, "?"c, "<"c, ">"c, "|"c, ChrW(34)}
+        r = r.Replace(c, "-"c)
+    Next
+    If r.Length > 70 Then r = r.Substring(0, 70)
+    Return r
+End Function
+
+Function GuessFastener(dIn As Double) As String
+    ' Determine nearest NOMINAL screw size, then intentionally round odd
+    ' screw numbers above #3 DOWN to the previous even size.
+    ' This is only a default suggestion, not a hardware design validation.
+    Dim sizes() As String = {"#0", "#1", "#2", "#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10", "#11", "#12", "1/4"}
+    Dim nominals() As Double = {0.060, 0.073, 0.086, 0.099, 0.112, 0.125, 0.138, 0.151, 0.164, 0.177, 0.190, 0.203, 0.216, 0.250}
+    Dim best As String = sizes(0)
+    Dim err As Double = Double.MaxValue
+    For i As Integer = 0 To sizes.Length - 1
+        Dim e As Double = System.Math.Abs(dIn - nominals(i))
+        If e < err Then
+            best = sizes(i)
+            err = e
+        End If
+    Next
+    Select Case best
+        Case "#5" : Return "#4"
+        Case "#7" : Return "#6"
+        Case "#9" : Return "#8"
+        Case "#11" : Return "#10"
+    End Select
+    Return best
+End Function
+
+Function PresetDiameter(size As String, fit As String) As Double
+    ' Typical US inch clearance-hole suggestions. VERIFY the relevant standard/table.
+    ' Format close, normal, loose in inches. Values are editable on the review form.
+    Dim options As New System.Collections.Generic.Dictionary(Of String, Double())(System.StringComparer.OrdinalIgnoreCase)
+    options.Add("#0", New Double() {0.063, 0.067, 0.070})
+    options.Add("#1", New Double() {0.076, 0.081, 0.089})
+    options.Add("#2", New Double() {0.089, 0.096, 0.106})
+    options.Add("#3", New Double() {0.101, 0.110, 0.116})
+    options.Add("#4", New Double() {0.116, 0.128, 0.144})
+    options.Add("#5", New Double() {0.128, 0.136, 0.154})
+    options.Add("#6", New Double() {0.144, 0.1495, 0.1695})
+    options.Add("#7", New Double() {0.157, 0.164, 0.183})  ' Uncommon size: approximate editable starting point
+    options.Add("#8", New Double() {0.1695, 0.177, 0.196})
+    options.Add("#9", New Double() {0.183, 0.189, 0.209})  ' Uncommon size: approximate editable starting point
+    options.Add("#10", New Double() {0.196, 0.201, 0.221})
+    options.Add("#11", New Double() {0.209, 0.215, 0.236})  ' Uncommon size: approximate editable starting point
+    options.Add("#12", New Double() {0.221, 0.228, 0.250})
+    options.Add("1/4", New Double() {0.257, 0.266, 0.281})
+    If Not options.ContainsKey(size) Then Return 0.0
+    Select Case fit
+        Case "Close" : Return options(size)(0)
+        Case "Normal" : Return options(size)(1)
+        Case "Loose" : Return options(size)(2)
+        Case Else : Return options(size)(1)
+    End Select
+End Function
+
+Public Class HoleReviewForm
+    Inherits System.Windows.Forms.Form
+    Private grd As System.Windows.Forms.DataGridView
+    Private items As System.Collections.Generic.SortedDictionary(Of String, InputBucket)
+    Private loading As Boolean = False
+
+    ' Columns: 0 source, 1 qty, 2 screw, 3 mode, 4 fit, 5 Ø, 6 thread type,
+    ' 7 designation, 8 class, 9 seat, 10 seat Ø, 11 depth/angle, 12 name,
+    ' 13 clearance standard, 14 fastener type (names from local Clearance.xls).
+    Public Sub New(buckets As System.Collections.Generic.SortedDictionary(Of String, InputBucket))
+        MyBase.New()
+        items = buckets
+        Me.Width = 1510 : Me.Height = 590
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable
+        Dim heading As New System.Windows.Forms.Label()
+        heading.Text = "One native Hole feature per complete specification. Clearance by default; Tapped and Custom/Press-Fit available."
+        heading.Left = 12 : heading.Top = 10 : heading.Width = 1440 : heading.Height = 24
+        heading.Anchor = System.Windows.Forms.AnchorStyles.Top Or System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
+        Me.Controls.Add(heading)
+        grd = New System.Windows.Forms.DataGridView()
+        grd.Left = 12 : grd.Top = 40 : grd.Width = 1465 : grd.Height = 408
+        grd.Anchor = System.Windows.Forms.AnchorStyles.Top Or System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
+        grd.AllowUserToAddRows = False : grd.AllowUserToDeleteRows = False
+        grd.RowHeadersVisible = False
+        grd.AutoSizeRowsMode = System.Windows.Forms.DataGridViewAutoSizeRowsMode.None
+        grd.SelectionMode = System.Windows.Forms.DataGridViewSelectionMode.CellSelect
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="Source", .HeaderText="Source Ø (in)", .Width=90, .ReadOnly=True})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="Qty", .HeaderText="Qty", .Width=38, .ReadOnly=True})
+        Dim sc As New System.Windows.Forms.DataGridViewComboBoxColumn()
+        sc.Name="Screw" : sc.HeaderText="Fastener" : sc.Width=80
+        sc.Items.AddRange(New Object() {"#0","#1","#2","#3","#4","#5","#6","#7","#8","#9","#10","#11","#12","1/4","Custom"})
+        grd.Columns.Add(sc)
+        Dim mc As New System.Windows.Forms.DataGridViewComboBoxColumn()
+        mc.Name="Mode" : mc.HeaderText="Hole type" : mc.Width=102
+        mc.Items.AddRange(New Object() {"Clearance","Threaded","Custom/Press-Fit"})
+        grd.Columns.Add(mc)
+        Dim fc As New System.Windows.Forms.DataGridViewComboBoxColumn()
+        fc.Name="Fit" : fc.HeaderText="Fit" : fc.Width=80
+        fc.Items.AddRange(New Object() {"Close","Normal","Loose","Custom","Press-Fit"})
+        grd.Columns.Add(fc)
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="Diameter", .HeaderText="Pilot Ø (in)", .Width=88})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ThreadType", .HeaderText="Thread table (type)", .Width=175})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ThreadDesignation", .HeaderText="Thread designation", .Width=123})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ThreadClass", .HeaderText="Class", .Width=55})
+        Dim seatCol As New System.Windows.Forms.DataGridViewComboBoxColumn()
+        seatCol.Name="Seat" : seatCol.HeaderText="Seat" : seatCol.Width=95
+        seatCol.Items.AddRange(New Object() {"None","Counterbore","Countersink","Spotface"})
+        grd.Columns.Add(seatCol)
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="SeatDiameter", .HeaderText="Seat Ø (in)", .Width=93})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="SeatDepthAngle", .HeaderText="Depth (in) / CS angle (°)", .Width=170})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="Group", .HeaderText="Group name", .Width=190})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ClearanceStandard", .HeaderText="Clearance standard (table)", .Width=175})
+        grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ClearanceFamily", .HeaderText="Clearance fastener family", .Width=240})
+        Me.Controls.Add(grd)
+        Dim note As New System.Windows.Forms.Label()
+        note.Left=12 : note.Top=460 : note.Width=1465 : note.Height=53
+        note.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
+        note.Text = "Clearance uses local Inventor Clearance.xls (diameter preview is approximate); Threaded uses Thread.xls (pilot Ø determined by table). " & _
+                    "For a custom/PEM hole choose Custom/Press-Fit and enter EXACT Ø. Seats: Counterbore/Spotface need Ø + depth; Countersink needs exact Ø and dropdown angle (82° default, 100° optional). For native clearance, edit the clearance-family column to match local table/head style."
+        Me.Controls.Add(note)
+        Dim ok As New System.Windows.Forms.Button()
+        ok.Text="Review and Generate" : ok.Width=172 : ok.Left=1288 : ok.Top=515
+        ok.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
+        AddHandler ok.Click, AddressOf AcceptClick
+        Me.Controls.Add(ok)
+        Dim cancel As New System.Windows.Forms.Button()
+        cancel.Text="Cancel" : cancel.Width=100 : cancel.Left=1178 : cancel.Top=515
+        cancel.Anchor= System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
+        AddHandler cancel.Click, AddressOf CancelClick
+        Me.Controls.Add(cancel)
+        ' No Form.AcceptButton/CancelButton due to Inventor 2027 .NET reference regression.
+        loading=True
+        For Each b As InputBucket In buckets.Values
+            grd.Rows.Add(b.SourceKey,b.Centers.Count.ToString(),b.Screw,b.Mode,b.Fit, _
+                b.DiameterIn.ToString("0.0000",System.Globalization.CultureInfo.InvariantCulture), _
+                b.ThreadType,b.ThreadDesignation,b.ThreadClass,b.Seat,"","",b.GroupLabel, _
+                b.ClearanceStandard,b.ClearanceFamily)
+        Next
+        For Each row As System.Windows.Forms.DataGridViewRow In grd.Rows
+            If Convert.ToString(row.Cells(9).Value)="Countersink" Then
+                SetSeatInputCell(row)
+            End If
+        Next
+        loading=False
+        AddHandler grd.CellValueChanged, AddressOf CellChanged
+        AddHandler grd.CurrentCellDirtyStateChanged, AddressOf CellDirty
+        AddHandler grd.DataError, AddressOf GridDataError
+    End Sub
+
+    Private Function MGHDefaultThread(size As String) As String
+    Select Case size
+        Case "#0" : Return "0-80 UNF"
+        Case "#1" : Return "1-64 UNC"
+        Case "#2" : Return "2-56 UNC"
+        Case "#3" : Return "3-48 UNC"
+        Case "#4" : Return "4-40 UNC"
+        Case "#5" : Return "5-40 UNC"
+        Case "#6" : Return "6-32 UNC"
+        Case "#7" : Return "7-32 UNC"
+        Case "#8" : Return "8-32 UNC"
+        Case "#9" : Return "9-24 UNC"
+        Case "#10" : Return "10-24 UNC"
+        Case "#11" : Return "11-24 UNC"
+        Case "#12" : Return "12-24 UNC"
+        Case "1/4" : Return "1/4-20 UNC"
+        Case Else : Return ""
+    End Select
+    End Function
+
+
+    ' DataGridView supports different cell editors in the same column.
+    ' For a countersink use a dropdown; for other seats keep an editable depth.
+    Private Sub SetSeatInputCell(row As System.Windows.Forms.DataGridViewRow)
+        Dim selectedSeat As String=Convert.ToString(row.Cells(9).Value)
+        If selectedSeat="Countersink" Then
+            Dim oldValue As String=Convert.ToString(row.Cells(11).Value).Trim()
+            Dim angleCell As New System.Windows.Forms.DataGridViewComboBoxCell()
+            angleCell.Items.AddRange(New Object() {"82","100"})
+            row.Cells(11)=angleCell
+            If oldValue="100" Then
+                row.Cells(11).Value="100"
+            Else
+                row.Cells(11).Value="82"
+            End If
+        Else
+            If TypeOf row.Cells(11) Is System.Windows.Forms.DataGridViewComboBoxCell Then
+                row.Cells(11)=New System.Windows.Forms.DataGridViewTextBoxCell()
+            End If
+            row.Cells(11).Value=""
+        End If
+    End Sub
+
+    Private Sub GridDataError(sender As Object, e As System.Windows.Forms.DataGridViewDataErrorEventArgs)
+        e.ThrowException=False
+    End Sub
+
+    Private Sub CellDirty(sender As Object, e As System.EventArgs)
+        If grd.IsCurrentCellDirty Then grd.CommitEdit(System.Windows.Forms.DataGridViewDataErrorContexts.Commit)
+    End Sub
+
+    Private Sub CellChanged(sender As Object, e As System.Windows.Forms.DataGridViewCellEventArgs)
+        If loading OrElse e.RowIndex<0 Then Return
+        If e.ColumnIndex<>2 AndAlso e.ColumnIndex<>3 AndAlso e.ColumnIndex<>4 AndAlso _
+           e.ColumnIndex<>9 AndAlso e.ColumnIndex<>11 Then Return
+        loading=True
+        Try
+            Dim row As System.Windows.Forms.DataGridViewRow=grd.Rows(e.RowIndex)
+            Dim sz As String=Convert.ToString(row.Cells(2).Value)
+            Dim mode As String=Convert.ToString(row.Cells(3).Value)
+            Dim fit As String=Convert.ToString(row.Cells(4).Value)
+            ' Only a fastener / hole type / fit change can repopulate pilot Ø.
+            ' Seat/angle edits must NOT overwrite a custom pilot diameter.
+            If e.ColumnIndex=2 OrElse e.ColumnIndex=3 OrElse e.ColumnIndex=4 Then
+                If e.ColumnIndex=2 Then row.Cells(7).Value=MGHDefaultThread(sz)
+                If mode="Clearance" Then
+                    If sz="Custom" OrElse fit="Custom" OrElse fit="Press-Fit" Then
+                        row.Cells(3).Value="Custom/Press-Fit"
+                        row.Cells(4).Value="Custom"
+                        row.Cells(5).Value=""
+                        row.Cells(12).Value="Custom hole - edit name"
+                    Else
+                        row.Cells(5).Value=PresetDiameter(sz,fit).ToString("0.0000",System.Globalization.CultureInfo.InvariantCulture)
+                        row.Cells(12).Value="Hole " & sz & " - " & fit
+                    End If
+                ElseIf mode="Threaded" Then
+                    row.Cells(4).Value="Custom"
+                    row.Cells(5).Value="" ' table drives tap drill diameter
+                    row.Cells(12).Value="Tapped " & Convert.ToString(row.Cells(7).Value)
+                Else
+                    row.Cells(4).Value="Custom"
+                    If e.ColumnIndex=3 Then row.Cells(5).Value=""
+                    row.Cells(12).Value="Custom / Press-Fit " & sz
+                End If
+            End If
+            If e.ColumnIndex=9 Then
+                ' Seat Ø is always explicit. The *included angle* is a choice,
+                ' with the US 82-degree countersink as default (100 also offered).
+                row.Cells(10).Value=""
+                SetSeatInputCell(row)
+                If Convert.ToString(row.Cells(9).Value)="Countersink" AndAlso _
+                   Convert.ToString(row.Cells(14).Value)="Flat Head Machine Screw (100)" Then
+                    row.Cells(14).Value="Flat Head Machine Screw (82)"
+                End If
+            End If
+            If e.ColumnIndex=11 AndAlso Convert.ToString(row.Cells(9).Value)="Countersink" Then
+                ' Synchronize the standard table's 82/100 flat-head family
+                ' with the requested included angle. Custom hardware families
+                ' are not modified automatically.
+                Dim family As String=Convert.ToString(row.Cells(14).Value)
+                If family="Flat Head Machine Screw (82)" OrElse _
+                   family="Flat Head Machine Screw (100)" Then
+                    row.Cells(14).Value="Flat Head Machine Screw (" & _
+                        Convert.ToString(row.Cells(11).Value) & ")"
+                End If
+            End If
+        Finally
+            loading=False
+        End Try
+    End Sub
+
+    Private Sub AcceptClick(sender As Object,e As System.EventArgs)
+        Try
+            grd.EndEdit()
+            Dim idx As Integer=0
+            For Each b As InputBucket In items.Values
+                Dim row As System.Windows.Forms.DataGridViewRow=grd.Rows(idx)
+                b.Screw=Convert.ToString(row.Cells(2).Value).Trim()
+                b.Mode=Convert.ToString(row.Cells(3).Value).Trim()
+                b.Fit=Convert.ToString(row.Cells(4).Value).Trim()
+                b.GroupLabel=Convert.ToString(row.Cells(12).Value).Trim()
+                b.ThreadType=Convert.ToString(row.Cells(6).Value).Trim()
+                b.ThreadDesignation=Convert.ToString(row.Cells(7).Value).Trim()
+                b.ThreadClass=Convert.ToString(row.Cells(8).Value).Trim()
+                b.ClearanceStandard=Convert.ToString(row.Cells(13).Value).Trim()
+                b.ClearanceFamily=Convert.ToString(row.Cells(14).Value).Trim()
+                b.Seat=Convert.ToString(row.Cells(9).Value).Trim()
+                If b.GroupLabel="" Then Throw New System.Exception("Enter a group name on row " & (idx+1).ToString())
+                If b.Mode="Clearance" Then
+                    If b.Screw="Custom" OrElse (b.Fit<>"Normal" AndAlso b.Fit<>"Close" AndAlso b.Fit<>"Loose") Then
+                        Throw New System.Exception("Native clearance needs a known fastener and Close/Normal/Loose fit on row " & (idx+1).ToString())
+                    End If
+                    If b.ClearanceStandard="" OrElse b.ClearanceFamily="" Then
+                        Throw New System.Exception("Enter clearance standard and fastener family on row " & (idx+1).ToString())
+                    End If
+                End If
+                If b.Mode="Threaded" Then
+                    If b.ThreadType="" OrElse b.ThreadDesignation="" OrElse b.ThreadClass="" Then
+                        Throw New System.Exception("Provide thread table, designation and class on row " & (idx+1).ToString())
+                    End If
+                    b.DiameterIn=0
+                Else
+                    Dim raw As String=Convert.ToString(row.Cells(5).Value).Trim()
+                    Dim diameter As Double=0
+                    If Not Double.TryParse(raw,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,diameter) OrElse diameter<=0.01 OrElse diameter>2 Then
+                        Throw New System.Exception("Enter hole Ø in inches (0.01 to 2.0) on row " & (idx+1).ToString())
+                    End If
+                    If b.Mode="Clearance" AndAlso System.Math.Abs(diameter-PresetDiameter(b.Screw,b.Fit))>0.00005 Then
+                        ' Explicit edit takes precedence over tabulated clearance sizing.
+                        b.Mode="Custom/Press-Fit" : b.Fit="Custom"
+                        If b.GroupLabel.StartsWith("Hole " & b.Screw & " - ") Then b.GroupLabel="Hole " & b.Screw & " - Custom"
+                    End If
+                    b.DiameterIn=diameter
+                End If
+                b.SeatDiameterIn=0 : b.SeatDepthIn=0 : b.SeatAngleDeg=0
+                If b.Seat<>"None" Then
+                    Dim diaText As String=Convert.ToString(row.Cells(10).Value).Trim()
+                    If Not Double.TryParse(diaText,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,b.SeatDiameterIn) OrElse b.SeatDiameterIn<=0 Then
+                        Throw New System.Exception("Enter seat Ø in inches on row " & (idx+1).ToString())
+                    End If
+                    Dim sizeText As String=Convert.ToString(row.Cells(11).Value).Trim()
+                    If b.Seat="Countersink" Then
+                        If Not Double.TryParse(sizeText,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,b.SeatAngleDeg) Then
+                            Throw New System.Exception("Enter countersink included angle in degrees (e.g. 82) on row " & (idx+1).ToString())
+                        End If
+                    Else
+                        If Not Double.TryParse(sizeText,System.Globalization.NumberStyles.Float,System.Globalization.CultureInfo.InvariantCulture,b.SeatDepthIn) Then
+                            Throw New System.Exception("Enter seat depth in inches on row " & (idx+1).ToString())
+                        End If
+                    End If
+                End If
+                idx+=1
+            Next
+            Me.DialogResult=System.Windows.Forms.DialogResult.OK : Me.Close()
+        Catch ex As System.Exception
+            System.Windows.Forms.MessageBox.Show(ex.Message,"Correct review grid")
+        End Try
+    End Sub
+
+    Private Function PresetDiameter(size As String,fit As String) As Double
+        Dim options As New System.Collections.Generic.Dictionary(Of String,Double())(System.StringComparer.OrdinalIgnoreCase)
+        options.Add("#0",New Double(){0.063,0.067,0.070})
+        options.Add("#1",New Double(){0.076,0.081,0.089})
+        options.Add("#2",New Double(){0.089,0.096,0.106})
+        options.Add("#3",New Double(){0.101,0.110,0.116})
+        options.Add("#4",New Double(){0.116,0.128,0.144})
+        options.Add("#5",New Double(){0.128,0.136,0.154})
+        options.Add("#6",New Double(){0.144,0.1495,0.1695})
+        options.Add("#7",New Double(){0.157,0.164,0.183})
+        options.Add("#8",New Double(){0.1695,0.177,0.196})
+        options.Add("#9",New Double(){0.183,0.189,0.209})
+        options.Add("#10",New Double(){0.196,0.201,0.221})
+        options.Add("#11",New Double(){0.209,0.215,0.236})
+        options.Add("#12",New Double(){0.221,0.228,0.250})
+        options.Add("1/4",New Double(){0.257,0.266,0.281})
+        If Not options.ContainsKey(size) Then Return 0.0
+        Select Case fit
+            Case "Close" : Return options(size)(0)
+            Case "Normal" : Return options(size)(1)
+            Case "Loose" : Return options(size)(2)
+            Case Else : Return options(size)(1)
+        End Select
+    End Function
+
+    Private Sub CancelClick(sender As Object,e As System.EventArgs)
+        Me.DialogResult=System.Windows.Forms.DialogResult.Cancel : Me.Close()
+    End Sub
+End Class
