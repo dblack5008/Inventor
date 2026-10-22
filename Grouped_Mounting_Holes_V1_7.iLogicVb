@@ -1,7 +1,7 @@
 ﻿' GROUPED MOUNTING HOLES - v1.7 (countersink 82/100 dropdown + exact seat verification) (Inventor 2027, assembly-level EXTERNAL iLogic rule)
 ' Uses native part Hole features: one feature and one point sketch per unique hole specification.
 ' Operates on the part file referenced by the selected plate occurrence. DOES NOT move components.
-' Select a planar plate face, select multiple circular edges OR cylindrical mounting-hole faces,
+' Select a planar plate face, then select circular hole rims on the mounted components.
 ' click FINISH SELECTION & REVIEW to finish (no ESC dependence). Clicked rims stay cyan while selecting.
 ' Review groups, then commit. Inward direction is VERIFIED by checking that solid
 ' material is removed at EVERY selected hole center (and flipped if necessary).
@@ -14,6 +14,7 @@
 ' A name change updates the existing feature. A specification change does not, and the rule explains why before cutting.
 ' Each identity field is its own attribute (Inventor string attributes hold 255 characters). The set is copied with the feature.
 ' After the holes succeed, the rule can place washers from the hardware library.
+' A washer sits on the component hole rim you clicked, or on the other end of that same hole.
 ' The file prompt opens Hardware\<size>\Washers (for example Hardware\#8\Washers). Nuts and screws are not placed yet.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
@@ -71,67 +72,27 @@ Sub Main()
 
     Dim invertPlate As Inventor.Matrix = plateOcc.Transformation.Copy()
     invertPlate.Invert()
-    ' Record the outward direction while the selected face is still valid.
-    ' Cutting the holes can invalidate that face, and reading it afterward raises E_FAIL.
-    Dim plateOutwardX As Double = platePlane.Normal.X
-    Dim plateOutwardY As Double = platePlane.Normal.Y
-    Dim plateOutwardZ As Double = platePlane.Normal.Z
-    Try
-        Dim plateOutward As Inventor.UnitVector = MGHFaceOutward(plateNativeFace, plateNativeFace.SurfaceBody, app)
-        plateOutwardX = plateOutward.X
-        plateOutwardY = plateOutward.Y
-        plateOutwardZ = plateOutward.Z
-    Catch
-    End Try
-
-    ' Custom labeled options replace misleading Yes / No buttons.
-    Dim modeDialog As New MGHModeDialog()
-    Dim modeChoice As System.Windows.Forms.DialogResult = modeDialog.ShowDialog()
-    modeDialog.Dispose()
-    If modeChoice <> System.Windows.Forms.DialogResult.Yes AndAlso _
-       modeChoice <> System.Windows.Forms.DialogResult.No Then Exit Sub
-    Dim selectEdges As Boolean = (modeChoice = System.Windows.Forms.DialogResult.Yes)
-    Dim pickFilter As Inventor.SelectionFilterEnum = If(selectEdges, _
-        Inventor.SelectionFilterEnum.kPartEdgeCircularFilter, _
-        Inventor.SelectionFilterEnum.kPartFaceCylindricalFilter)
 
     Dim holeSelector As New MGHInteractionSelector()
     Dim gotHoles As Boolean = holeSelector.Run( _
-        app, pickFilter, "Select Component Mounting Holes", _
-        "Click each " & If(selectEdges, "circular hole rim", "cylindrical hole wall") & _
-        ". When finished, click FINISH SELECTION & REVIEW in the floating palette.", False)
+        app, Inventor.SelectionFilterEnum.kPartEdgeCircularFilter, _
+        "Select Component Mounting Holes", _
+        "Click each circular hole rim on the mounted component. When finished, click FINISH SELECTION & REVIEW in the floating palette.", False)
     If Not gotHoles Then Exit Sub
 
     Dim selected As New System.Collections.Generic.List(Of MountPoint)()
     Dim excluded As New System.Collections.Generic.List(Of String)()
     For Each item As Object In holeSelector.Picked
         Try
-            Dim measuredCenter As Inventor.Point = Nothing
-            Dim measuredAxis As Inventor.UnitVector = Nothing
-            Dim radiusCm As Double = 0
-            Dim sourceName As String = ""
-            Dim sourceOccurrence As Inventor.ComponentOccurrence = Nothing
-
-            If selectEdges Then
-                Dim e As Inventor.EdgeProxy = TryCast(item, Inventor.EdgeProxy)
-                If e Is Nothing Then Throw New System.Exception("Not an assembly circular edge.")
-                Dim circ As Inventor.Circle = TryCast(e.Geometry, Inventor.Circle)
-                If circ Is Nothing Then Throw New System.Exception("Only full circular edges are supported; select the complete hole rim.")
-                measuredCenter = circ.Center
-                measuredAxis = circ.Normal
-                radiusCm = circ.Radius
-                sourceOccurrence = e.ContainingOccurrence
-            Else
-                Dim f As Inventor.FaceProxy = TryCast(item, Inventor.FaceProxy)
-                If f Is Nothing Then Throw New System.Exception("Not an assembly cylindrical face.")
-                Dim cyl As Inventor.Cylinder = TryCast(f.Geometry, Inventor.Cylinder)
-                If cyl Is Nothing Then Throw New System.Exception("Selected face is not cylindrical.")
-                measuredCenter = cyl.BasePoint
-                measuredAxis = cyl.AxisVector
-                radiusCm = cyl.Radius
-                sourceOccurrence = f.ContainingOccurrence
-            End If
-            sourceName = sourceOccurrence.Name
+            Dim e As Inventor.EdgeProxy = TryCast(item, Inventor.EdgeProxy)
+            If e Is Nothing Then Throw New System.Exception("Not an assembly circular edge.")
+            Dim circ As Inventor.Circle = TryCast(e.Geometry, Inventor.Circle)
+            If circ Is Nothing Then Throw New System.Exception("Only full circular edges are supported; select the complete hole rim.")
+            Dim measuredCenter As Inventor.Point = circ.Center
+            Dim measuredAxis As Inventor.UnitVector = circ.Normal
+            Dim radiusCm As Double = circ.Radius
+            Dim sourceOccurrence As Inventor.ComponentOccurrence = e.ContainingOccurrence
+            Dim sourceName As String = sourceOccurrence.Name
             If sourceOccurrence.Definition.Document.FullFileName = plateDoc.FullFileName Then
                 Throw New System.Exception("Source is a face/edge on the plate itself.")
             End If
@@ -162,6 +123,17 @@ Sub Main()
             rec.Center = onPlane
             rec.SourceDiameterIn = (radiusCm * 2.0 / 2.54)
             rec.SourceName = sourceName
+            Dim rimRec As New MGHComponentRim()
+            rimRec.Component = sourceOccurrence
+            rimRec.SelectedEdge = e
+            rimRec.CenterX = measuredCenter.X
+            rimRec.CenterY = measuredCenter.Y
+            rimRec.CenterZ = measuredCenter.Z
+            rimRec.AxisX = measuredAxis.X
+            rimRec.AxisY = measuredAxis.Y
+            rimRec.AxisZ = measuredAxis.Z
+            rimRec.Radius = radiusCm
+            rec.Rim = rimRec
             selected.Add(rec)
         Catch ex As System.Exception
             excluded.Add("Skipped selection " & (selected.Count + excluded.Count + 1).ToString() & ": " & ex.Message)
@@ -194,6 +166,7 @@ Sub Main()
             buckets.Add(key, b)
         End If
         buckets(key).Centers.Add(m.Center)
+        buckets(key).Rims.Add(m.Rim)
     Next
 
     ' Restore saved group names before the review grid is built. The grid's
@@ -282,6 +255,9 @@ Sub Main()
             End If
             For Each p As Inventor.Point In b.Centers
                 desiredGroups(key).Centers.Add(p)
+            Next
+            For Each rim As MGHComponentRim In b.Rims
+                desiredGroups(key).Rims.Add(rim)
             Next
             MGHProgressTick(reviewProgress, app, "Grouped source Ø" & b.SourceKey & " — " & b.Centers.Count.ToString() & " positions")
         Next
@@ -655,7 +631,7 @@ Sub Main()
         End If
         Dim washerSummary As String = ""
         Try
-            washerSummary = MGHPlaceWashers(app, aDoc, plateOcc, plateDef, plateOutwardX, plateOutwardY, plateOutwardZ, desiredGroups)
+            washerSummary = MGHPlaceWashers(app, aDoc, desiredGroups)
         Catch washerEx As System.Exception
             washerSummary = "Washers were not placed." & vbCrLf & washerEx.Message
         End Try
@@ -842,8 +818,7 @@ Public Class MGHInteractionSelector
                         ' If user selects an edge, highlight that exact rim.
                         highlightSet.AddItem(ent)
                     Else
-                        ' If user selects a cylindrical bore wall, highlight
-                        ' the circular bounding rims, not the entire bore wall.
+                        ' A face selection highlights its circular rims.
                         Dim foundRims As Boolean = False
                         For Each e As Object In face.Edges
                             Try
@@ -959,55 +934,6 @@ Public Class MGHSelectionPalette
     End Sub
 End Class
 
-Public Class MGHModeDialog
-    Inherits System.Windows.Forms.Form
-
-    Public Sub New()
-        MyBase.New()
-        Me.Text = "How do you want to select mounting holes?"
-        Me.Width = 585 : Me.Height = 245
-        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
-        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
-        Me.MaximizeBox = False : Me.MinimizeBox = False
-        Dim note As New System.Windows.Forms.Label()
-        note.Left = 14 : note.Top = 16 : note.Width = 545 : note.Height = 75
-        note.Text = "Choose which geometry you will click on the mounted components." & _
-            vbCrLf & "You can select many holes, then click FINISH SELECTION & REVIEW."
-        Me.Controls.Add(note)
-
-        Dim rim As New System.Windows.Forms.Button()
-        rim.Text = "Select Circular Hole Edges"
-        rim.Left = 14 : rim.Top = 103 : rim.Width = 255 : rim.Height = 40
-        AddHandler rim.Click, AddressOf ChooseRims
-        Me.Controls.Add(rim)
-
-        Dim wall As New System.Windows.Forms.Button()
-        wall.Text = "Select Cylindrical Hole Faces"
-        wall.Left = 284 : wall.Top = 103 : wall.Width = 275 : wall.Height = 40
-        AddHandler wall.Click, AddressOf ChooseWalls
-        Me.Controls.Add(wall)
-
-        Dim cancel As New System.Windows.Forms.Button()
-        cancel.Text = "Cancel Without Changes"
-        cancel.Left = 375 : cancel.Top = 154 : cancel.Width = 184 : cancel.Height = 30
-        AddHandler cancel.Click, AddressOf ChooseCancel
-        Me.Controls.Add(cancel)
-    End Sub
-
-    Private Sub ChooseRims(sender As Object, e As System.EventArgs)
-        Me.DialogResult = System.Windows.Forms.DialogResult.Yes
-        Me.Close()
-    End Sub
-    Private Sub ChooseWalls(sender As Object, e As System.EventArgs)
-        Me.DialogResult = System.Windows.Forms.DialogResult.No
-        Me.Close()
-    End Sub
-    Private Sub ChooseCancel(sender As Object, e As System.EventArgs)
-        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
-        Me.Close()
-    End Sub
-End Class
-
 Public Class MGHGenerateDialog
     Inherits System.Windows.Forms.Form
 
@@ -1056,12 +982,12 @@ Public Class MGHGenerateDialog
     End Sub
 End Class
 
-' One choice for the whole run: which plate face the washers sit on.
-' The library path is remembered on the assembly after a face is chosen.
+' One choice for the whole run: which end of the selected component hole gets the washer.
+' The library path is remembered on the assembly after an end is chosen.
 Public Class MGHWasherSideDialog
     Inherits System.Windows.Forms.Form
     Private libraryBox As System.Windows.Forms.TextBox
-    Public OnSelectedFace As Boolean
+    Public OnSelectedRim As Boolean
     Public LibraryPath As String
 
     Public Sub New(initialLibrary As String)
@@ -1073,9 +999,9 @@ Public Class MGHWasherSideDialog
         Me.MaximizeBox = False : Me.MinimizeBox = False
         Dim note As New System.Windows.Forms.Label()
         note.Left = 14 : note.Top = 12 : note.Width = 600 : note.Height = 72
-        note.Text = "Washers are placed at every hole in this run, one part per fastener size." & vbCrLf & _
+        note.Text = "Washers are placed on the component holes whose rims you clicked, one part per fastener size." & vbCrLf & _
             "The next window opens that size's Washers folder so you can pick the .ipt." & vbCrLf & _
-            "Opposite face is the nut side. Selected face is the face you clicked on the plate."
+            "Selected rim is the edge you clicked. Opposite end is the other side of that same hole."
         Me.Controls.Add(note)
         Dim libraryLabel As New System.Windows.Forms.Label()
         libraryLabel.Left = 14 : libraryLabel.Top = 92 : libraryLabel.Width = 90 : libraryLabel.Height = 22
@@ -1088,12 +1014,12 @@ Public Class MGHWasherSideDialog
         Me.Controls.Add(libraryBox)
 
         Dim oppositeBtn As New System.Windows.Forms.Button()
-        oppositeBtn.Text = "Opposite Face (Nut Side)"
+        oppositeBtn.Text = "Opposite End of Hole"
         oppositeBtn.Left = 14 : oppositeBtn.Top = 132 : oppositeBtn.Width = 290 : oppositeBtn.Height = 40
         AddHandler oppositeBtn.Click, AddressOf ChooseOpposite
         Me.Controls.Add(oppositeBtn)
         Dim selectedBtn As New System.Windows.Forms.Button()
-        selectedBtn.Text = "Selected Face"
+        selectedBtn.Text = "Selected Hole Rim"
         selectedBtn.Left = 316 : selectedBtn.Top = 132 : selectedBtn.Width = 288 : selectedBtn.Height = 40
         AddHandler selectedBtn.Click, AddressOf ChooseSelected
         Me.Controls.Add(selectedBtn)
@@ -1111,13 +1037,13 @@ Public Class MGHWasherSideDialog
 
     Private Sub ChooseOpposite(sender As Object, e As System.EventArgs)
         LibraryPath = libraryBox.Text.Trim()
-        OnSelectedFace = False
+        OnSelectedRim = False
         Me.DialogResult = System.Windows.Forms.DialogResult.OK
         Me.Close()
     End Sub
     Private Sub ChooseSelected(sender As Object, e As System.EventArgs)
         LibraryPath = libraryBox.Text.Trim()
-        OnSelectedFace = True
+        OnSelectedRim = True
         Me.DialogResult = System.Windows.Forms.DialogResult.OK
         Me.Close()
     End Sub
@@ -1137,15 +1063,37 @@ Public Class MGHWasherSideDialog
     End Sub
 End Class
 
+' The component hole the user clicked. CenterX/Y/Z are assembly coordinates of that rim.
+Public Class MGHComponentRim
+    Public Component As Inventor.ComponentOccurrence
+    Public SelectedEdge As Inventor.Edge
+    Public CenterX As Double
+    Public CenterY As Double
+    Public CenterZ As Double
+    Public AxisX As Double
+    Public AxisY As Double
+    Public AxisZ As Double
+    Public Radius As Double
+End Class
+
+Public Class MGHRimCandidate
+    Public X As Double
+    Public Y As Double
+    Public Z As Double
+    Public Radius As Double
+End Class
+
 Public Class MountPoint
     Public Center As Inventor.Point
     Public SourceDiameterIn As Double
     Public SourceName As String
+    Public Rim As MGHComponentRim
 End Class
 
 Public Class InputBucket
     Public SourceKey As String
     Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
+    Public Rims As New System.Collections.Generic.List(Of MGHComponentRim)()
     Public Screw As String
     Public Fit As String
     Public DiameterIn As Double
@@ -1181,6 +1129,7 @@ Public Class OutputGroup
     Public LegacyKey As String
     Public PlaneId As String
     Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
+    Public Rims As New System.Collections.Generic.List(Of MGHComponentRim)()
 End Class
 
 ' Parsed form of a feature's stored identity. SpecKey excludes the group name.
@@ -1748,6 +1697,62 @@ Function MGHDistanceToAxis(px As Double, py As Double, pz As Double, ax As Doubl
     Return System.Math.Sqrt(cx * cx + cy * cy + cz * cz)
 End Function
 
+' Index of the other end of the selected hole, or -1. A matching radius wins.
+' Otherwise the farthest rim on the axis that is not larger than the selected hole.
+Function MGHChooseOppositeRim(selX As Double, selY As Double, selZ As Double, _
+    axisX As Double, axisY As Double, axisZ As Double, selRadius As Double, _
+    candidates As System.Collections.Generic.List(Of MGHRimCandidate)) As Integer
+    Dim sameSize As Integer = MGHFarthestRim(selX, selY, selZ, axisX, axisY, axisZ, selRadius, candidates, True)
+    If sameSize >= 0 Then Return sameSize
+    Return MGHFarthestRim(selX, selY, selZ, axisX, axisY, axisZ, selRadius, candidates, False)
+End Function
+
+Function MGHFarthestRim(selX As Double, selY As Double, selZ As Double, _
+    axisX As Double, axisY As Double, axisZ As Double, selRadius As Double, _
+    candidates As System.Collections.Generic.List(Of MGHRimCandidate), sameRadius As Boolean) As Integer
+    If candidates Is Nothing Then Return -1
+    Dim best As Integer = -1
+    Dim bestDist As Double = 0
+    Dim i As Integer
+    For i = 0 To candidates.Count - 1
+        Dim c As MGHRimCandidate = candidates(i)
+        If c Is Nothing Then Continue For
+        If MGHDistanceToAxis(c.X, c.Y, c.Z, selX, selY, selZ, axisX, axisY, axisZ) > 0.05 Then Continue For
+        Dim dx As Double = c.X - selX
+        Dim dy As Double = c.Y - selY
+        Dim dz As Double = c.Z - selZ
+        Dim dist As Double = System.Math.Sqrt(dx * dx + dy * dy + dz * dz)
+        If dist < 0.02 Then Continue For
+        If sameRadius Then
+            If System.Math.Abs(c.Radius - selRadius) > System.Math.Max(0.05, selRadius * 0.2) Then Continue For
+        ElseIf c.Radius > selRadius * 1.05 OrElse c.Radius <= 0.02 Then
+            Continue For
+        End If
+        If best < 0 OrElse dist > bestDist + 0.0000001 Then
+            best = i
+            bestDist = dist
+        End If
+    Next
+    Return best
+End Function
+
+' atSelected points out of the hole at the clicked rim. Otherwise it points out at the far rim.
+Sub MGHOutwardFromEnds(selX As Double, selY As Double, selZ As Double, _
+    otherX As Double, otherY As Double, otherZ As Double, atSelected As Boolean, _
+    ByRef ox As Double, ByRef oy As Double, ByRef oz As Double)
+    If atSelected Then
+        ox = selX - otherX : oy = selY - otherY : oz = selZ - otherZ
+    Else
+        ox = otherX - selX : oy = otherY - selY : oz = otherZ - selZ
+    End If
+    Dim length As Double = System.Math.Sqrt(ox * ox + oy * oy + oz * oz)
+    If length < 0.000000001 Then
+        ox = 0 : oy = 0 : oz = 0
+    Else
+        ox /= length : oy /= length : oz /= length
+    End If
+End Sub
+
 ' Outward unit vector of a planar face, pointing out of the solid.
 Function MGHFaceOutward(face As Inventor.Face, body As Inventor.SurfaceBody, app As Inventor.Application) As Inventor.UnitVector
     Dim pl As Inventor.Plane = TryCast(face.Geometry, Inventor.Plane)
@@ -1764,51 +1769,6 @@ Function MGHFaceOutward(face As Inventor.Face, body As Inventor.SurfaceBody, app
     If plusInside AndAlso Not minusInside Then Return tg.CreateUnitVector(-n.X, -n.Y, -n.Z)
     If face.IsParamReversed Then Return tg.CreateUnitVector(-n.X, -n.Y, -n.Z)
     Return n
-End Function
-
-' Circular rim of the hole at this center. The selected face uses the rim on the clicked
-' face. The opposite face uses the rim farthest through the plate.
-Function MGHFindHoleRim(def As Inventor.PartComponentDefinition, center As Inventor.Point, _
-    outward As Inventor.UnitVector, onSelectedFace As Boolean) As Inventor.Edge
-    Dim best As Inventor.Edge = Nothing
-    Dim bestAlong As Double = 0
-    Dim have As Boolean = False
-    For Each hf As Inventor.HoleFeature In def.Features.HoleFeatures
-        Dim created As Inventor.Faces = Nothing
-        Try
-            created = hf.Faces
-        Catch
-            created = Nothing
-        End Try
-        If created Is Nothing Then Continue For
-        For Each f As Inventor.Face In created
-            For Each e As Inventor.Edge In f.Edges
-                Dim edgeCenter As Inventor.Point = Nothing
-                Dim radius As Double = 0
-                If Not MGHCircularEdge(e, edgeCenter, radius) Then Continue For
-                If radius < 0.02 Then Continue For
-                Dim radial As Double = MGHDistanceToAxis(edgeCenter.X, edgeCenter.Y, edgeCenter.Z, _
-                    center.X, center.Y, center.Z, outward.X, outward.Y, outward.Z)
-                If radial > 0.05 Then Continue For
-                Dim along As Double = (edgeCenter.X - center.X) * outward.X + _
-                    (edgeCenter.Y - center.Y) * outward.Y + (edgeCenter.Z - center.Z) * outward.Z
-                Dim take As Boolean = False
-                If Not have Then
-                    take = True
-                ElseIf onSelectedFace Then
-                    If System.Math.Abs(along) < System.Math.Abs(bestAlong) - 0.0000001 Then take = True
-                ElseIf along < bestAlong - 0.0000001 Then
-                    take = True
-                End If
-                If take Then
-                    best = e
-                    bestAlong = along
-                    have = True
-                End If
-            Next
-        Next
-    Next
-    Return best
 End Function
 
 Function MGHReadWasher(app As Inventor.Application, path As String) As MGHWasherModel
@@ -2121,21 +2081,26 @@ Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.Assembl
 End Function
 
 ' Empty result means the insert constraint seated the washer. Otherwise the washer is grounded in place.
+' hostOcc is the component that owns the hole. An edge that is already an assembly proxy is used as-is.
 Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    plateOcc As Inventor.ComponentOccurrence, washerOcc As Inventor.ComponentOccurrence, _
+    hostOcc As Inventor.ComponentOccurrence, washerOcc As Inventor.ComponentOccurrence, _
     holeEdge As Inventor.Edge, model As MGHWasherModel, contact As Inventor.Point, _
     outward As Inventor.UnitVector) As String
-    Dim plateSaved As Inventor.Matrix = plateOcc.Transformation.Copy()
     Dim washerSaved As Inventor.Matrix = washerOcc.Transformation.Copy()
-    Dim plateWasGrounded As Boolean = plateOcc.Grounded
-    Dim heldPlate As Boolean = False
-    If Not plateWasGrounded Then
-        Try
-            plateOcc.Grounded = True
-            heldPlate = True
-        Catch
-            heldPlate = False
-        End Try
+    Dim hostSaved As Inventor.Matrix = Nothing
+    Dim hostWasGrounded As Boolean = True
+    Dim heldHost As Boolean = False
+    If hostOcc IsNot Nothing Then
+        hostSaved = hostOcc.Transformation.Copy()
+        hostWasGrounded = hostOcc.Grounded
+        If Not hostWasGrounded Then
+            Try
+                hostOcc.Grounded = True
+                heldHost = True
+            Catch
+                heldHost = False
+            End Try
+        End If
     End If
     Dim inserted As Inventor.InsertConstraint = Nothing
     Dim attempt As Integer
@@ -2153,9 +2118,12 @@ Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.Assembl
             End Try
         End If
         Try
-            Dim holeProxy As Object = Nothing
+            Dim holeProxy As Object = holeEdge
+            If TryCast(holeEdge, Inventor.EdgeProxy) Is Nothing Then
+                If hostOcc Is Nothing Then Throw New System.Exception("the component occurrence is missing")
+                hostOcc.CreateGeometryProxy(holeEdge, holeProxy)
+            End If
             Dim washerProxy As Object = Nothing
-            plateOcc.CreateGeometryProxy(holeEdge, holeProxy)
             washerOcc.CreateGeometryProxy(model.BearingEdge, washerProxy)
             inserted = asm.ComponentDefinition.Constraints.AddInsertConstraint(washerProxy, holeProxy, opposed, 0)
             asm.Update2(True)
@@ -2164,25 +2132,27 @@ Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.Assembl
         End Try
         If inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app) Then Exit For
     Next
-    If heldPlate Then
+    If heldHost Then
         Try
-            plateOcc.Grounded = False
+            hostOcc.Grounded = False
         Catch
         End Try
     End If
-    Dim plateMoved As Boolean = MGHMatrixMoved(app, plateSaved, plateOcc.Transformation)
+    Dim hostMoved As Boolean = hostOcc IsNot Nothing AndAlso hostSaved IsNot Nothing AndAlso MGHMatrixMoved(app, hostSaved, hostOcc.Transformation)
     Dim seated As Boolean = inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app)
-    If plateMoved OrElse Not seated Then
+    If hostMoved OrElse Not seated Then
         If inserted IsNot Nothing Then
             Try
                 inserted.Delete()
             Catch
             End Try
         End If
-        Try
-            plateOcc.Transformation = plateSaved
-        Catch
-        End Try
+        If hostOcc IsNot Nothing AndAlso hostSaved IsNot Nothing Then
+            Try
+                hostOcc.Transformation = hostSaved
+            Catch
+            End Try
+        End If
         Try
             washerOcc.Transformation = washerSaved
         Catch
@@ -2191,15 +2161,134 @@ Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.Assembl
             washerOcc.Grounded = True
         Catch
         End Try
-        If plateMoved Then Return "grounded so the plate would not move"
+        If hostMoved Then Return "grounded so the component would not move"
         Return "positioned and grounded because the insert constraint did not seat it"
     End If
     Return ""
 End Function
 
+Function MGHNativeSelectedEdge(rim As MGHComponentRim) As Inventor.Edge
+    If rim Is Nothing OrElse rim.SelectedEdge Is Nothing Then Return Nothing
+    Dim proxy As Inventor.EdgeProxy = TryCast(rim.SelectedEdge, Inventor.EdgeProxy)
+    If proxy IsNot Nothing Then Return proxy.NativeObject
+    Return rim.SelectedEdge
+End Function
+
+Function MGHOppositeComponentEdge(selected As Inventor.Edge) As Inventor.Edge
+    If selected Is Nothing Then Return Nothing
+    Dim circ As Inventor.Circle = TryCast(selected.Geometry, Inventor.Circle)
+    If circ Is Nothing Then Return Nothing
+    Dim body As Inventor.SurfaceBody = Nothing
+    For Each f As Inventor.Face In selected.Faces
+        body = f.SurfaceBody
+        If body IsNot Nothing Then Exit For
+    Next
+    If body Is Nothing Then Return Nothing
+    Dim candidates As New System.Collections.Generic.List(Of MGHRimCandidate)()
+    Dim edges As New System.Collections.Generic.List(Of Inventor.Edge)()
+    For Each f As Inventor.Face In body.Faces
+        For Each ed As Inventor.Edge In f.Edges
+            Dim edgeCenter As Inventor.Point = Nothing
+            Dim edgeRadius As Double = 0
+            If Not MGHCircularEdge(ed, edgeCenter, edgeRadius) Then Continue For
+            Dim sample As New MGHRimCandidate()
+            sample.X = edgeCenter.X
+            sample.Y = edgeCenter.Y
+            sample.Z = edgeCenter.Z
+            sample.Radius = edgeRadius
+            candidates.Add(sample)
+            edges.Add(ed)
+        Next
+    Next
+    Dim index As Integer = MGHChooseOppositeRim(circ.Center.X, circ.Center.Y, circ.Center.Z, _
+        circ.Normal.X, circ.Normal.Y, circ.Normal.Z, circ.Radius, candidates)
+    If index < 0 Then Return Nothing
+    Return edges(index)
+End Function
+
+Function MGHNativeEdgeOutward(edge As Inventor.Edge, app As Inventor.Application) As Inventor.UnitVector
+    Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
+    If circ Is Nothing Then Throw New System.Exception("The component hole rim is not circular.")
+    Dim normal As Inventor.UnitVector = circ.Normal
+    For Each f As Inventor.Face In edge.Faces
+        If Not TypeOf f.Geometry Is Inventor.Plane Then Continue For
+        Try
+            Dim outDir As Inventor.UnitVector = MGHFaceOutward(f, f.SurfaceBody, app)
+            If outDir.DotProduct(normal) < 0 Then Return app.TransientGeometry.CreateUnitVector(-normal.X, -normal.Y, -normal.Z)
+            Return normal
+        Catch
+        End Try
+    Next
+    Return normal
+End Function
+
+' Contact and outward are assembly coordinates. The clicked rim's proxy geometry is already
+' in assembly space, so the other end is that point plus the part-space hole depth.
+' holeEdge is an assembly proxy when one can be made.
+' Returns False when the opposite end of this component hole cannot be found.
+Function MGHComponentWasherSeat(app As Inventor.Application, rim As MGHComponentRim, onSelectedRim As Boolean, _
+    ByRef contact As Inventor.Point, ByRef outward As Inventor.UnitVector, ByRef holeEdge As Inventor.Edge) As Boolean
+    contact = Nothing
+    outward = Nothing
+    holeEdge = Nothing
+    If rim Is Nothing OrElse rim.Component Is Nothing OrElse rim.SelectedEdge Is Nothing Then
+        Throw New System.Exception("the selected component hole is missing")
+    End If
+    Dim nativeEdge As Inventor.Edge = MGHNativeSelectedEdge(rim)
+    If nativeEdge Is Nothing Then Throw New System.Exception("the selected component rim is missing")
+    Dim nativeCirc As Inventor.Circle = TryCast(nativeEdge.Geometry, Inventor.Circle)
+    If nativeCirc Is Nothing Then Throw New System.Exception("the selected component rim is not a full circle")
+    Dim axisLen As Double = System.Math.Sqrt(rim.AxisX * rim.AxisX + rim.AxisY * rim.AxisY + rim.AxisZ * rim.AxisZ)
+    If axisLen < 0.000000001 Then Throw New System.Exception("the selected component rim has no axis")
+    Dim axisX As Double = rim.AxisX / axisLen
+    Dim axisY As Double = rim.AxisY / axisLen
+    Dim axisZ As Double = rim.AxisZ / axisLen
+    Dim oppositeEdge As Inventor.Edge = Nothing
+    Try
+        oppositeEdge = MGHOppositeComponentEdge(nativeEdge)
+    Catch
+        oppositeEdge = Nothing
+    End Try
+    Dim along As Double = 0
+    Dim haveOpposite As Boolean = False
+    If oppositeEdge IsNot Nothing Then
+        Dim oppCenter As Inventor.Point = Nothing
+        Dim oppRadius As Double = 0
+        If MGHCircularEdge(oppositeEdge, oppCenter, oppRadius) Then
+            along = (oppCenter.X - nativeCirc.Center.X) * nativeCirc.Normal.X + _
+                (oppCenter.Y - nativeCirc.Center.Y) * nativeCirc.Normal.Y + _
+                (oppCenter.Z - nativeCirc.Center.Z) * nativeCirc.Normal.Z
+            haveOpposite = System.Math.Abs(along) >= 0.02
+        End If
+    End If
+    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim outSign As Double = 1
+    If onSelectedRim Then
+        holeEdge = rim.SelectedEdge
+        contact = tg.CreatePoint(rim.CenterX, rim.CenterY, rim.CenterZ)
+        If haveOpposite Then
+            outSign = If(along > 0, -1.0, 1.0)
+        Else
+            Dim partOut As Inventor.UnitVector = MGHNativeEdgeOutward(nativeEdge, app)
+            outSign = If(partOut.DotProduct(nativeCirc.Normal) < 0, -1.0, 1.0)
+        End If
+    Else
+        If Not haveOpposite Then Return False
+        contact = tg.CreatePoint(rim.CenterX + along * axisX, rim.CenterY + along * axisY, rim.CenterZ + along * axisZ)
+        outSign = If(along > 0, 1.0, -1.0)
+        Try
+            Dim proxyObj As Object = Nothing
+            rim.Component.CreateGeometryProxy(oppositeEdge, proxyObj)
+            holeEdge = TryCast(proxyObj, Inventor.Edge)
+        Catch
+            holeEdge = Nothing
+        End Try
+    End If
+    outward = tg.CreateUnitVector(outSign * axisX, outSign * axisY, outSign * axisZ)
+    Return True
+End Function
+
 Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    plateOcc As Inventor.ComponentOccurrence, plateDef As Inventor.PartComponentDefinition, _
-    outwardX As Double, outwardY As Double, outwardZ As Double, _
     groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup)) As String
     Dim notes As New System.Collections.Generic.List(Of String)()
     ' iLogic already has a transaction open on the assembly. Starting a second one
@@ -2227,7 +2316,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     If library = "" OrElse Not System.IO.Directory.Exists(library) Then library = MGHDefaultHardwareLibrary()
     Dim sideDialog As New MGHWasherSideDialog(library)
     Dim sideResult As System.Windows.Forms.DialogResult = sideDialog.ShowDialog()
-    Dim onSelectedFace As Boolean = sideDialog.OnSelectedFace
+    Dim onSelectedRim As Boolean = sideDialog.OnSelectedRim
     library = sideDialog.LibraryPath
     sideDialog.Dispose()
     If sideResult <> System.Windows.Forms.DialogResult.OK Then Return "Washers: skipped."
@@ -2294,62 +2383,32 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     Dim placed As Integer = 0
     Dim replaced As Integer = 0
     stepName = "Placing washers in the assembly"
-    Dim tg As Inventor.TransientGeometry = app.TransientGeometry
-    Dim outwardLen As Double = System.Math.Sqrt(outwardX * outwardX + outwardY * outwardY + outwardZ * outwardZ)
-    If outwardLen < 0.000000001 Then Throw New System.Exception("The selected face has no outward direction.")
-    Dim outwardPlate As Inventor.UnitVector = tg.CreateUnitVector(outwardX / outwardLen, outwardY / outwardLen, outwardZ / outwardLen)
         For Each g As OutputGroup In groups.Values
             If g.Screw Is Nothing OrElse Not models.ContainsKey(g.Screw.Trim()) Then Continue For
             Dim model As MGHWasherModel = models(g.Screw.Trim())
             Dim sizeName As String = g.Screw.Trim()
-            For Each center As Inventor.Point In g.Centers
+            Dim centerIndex As Integer
+            For centerIndex = 0 To g.Centers.Count - 1
+                Dim center As Inventor.Point = g.Centers(centerIndex)
                 Dim washerOcc As Inventor.ComponentOccurrence = Nothing
                 Dim kept As Boolean = False
-                Dim action As String = "finding the hole rim"
+                Dim action As String = "finding the component hole"
                 Try
                     app.StatusBarText = "Placing " & sizeName & " washer"
-                    Dim holeEdge As Inventor.Edge = Nothing
-                    Try
-                        holeEdge = MGHFindHoleRim(plateDef, center, outwardPlate, onSelectedFace)
-                    Catch rimEx As System.Exception
-                        If Not onSelectedFace Then
-                            notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far side of the hole was not found (" & rimEx.Message & ").")
-                            Continue For
-                        End If
-                    End Try
-                    If holeEdge Is Nothing AndAlso Not onSelectedFace Then
-                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far side of the hole was not found.")
+                    Dim rim As MGHComponentRim = Nothing
+                    If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
+                    If rim Is Nothing Then
+                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
                         Continue For
                     End If
                     action = "preparing the washer position"
-                    Dim contactPlate As Inventor.Point
-                    Dim outwardPart As Inventor.UnitVector
-                    If onSelectedFace Then
-                        contactPlate = center.Copy()
-                        outwardPart = outwardPlate
-                    Else
-                        Dim farCenter As Inventor.Point = Nothing
-                        Dim farRadius As Double = 0
-                        If Not MGHCircularEdge(holeEdge, farCenter, farRadius) Then
-                            notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far rim is not circular.")
-                            Continue For
-                        End If
-                        contactPlate = farCenter.Copy()
-                        outwardPart = tg.CreateUnitVector(-outwardPlate.X, -outwardPlate.Y, -outwardPlate.Z)
+                    Dim contact As Inventor.Point = Nothing
+                    Dim outwardAsm As Inventor.UnitVector = Nothing
+                    Dim holeEdge As Inventor.Edge = Nothing
+                    If Not MGHComponentWasherSeat(app, rim, onSelectedRim, contact, outwardAsm, holeEdge) Then
+                        notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the other end of that component hole was not found.")
+                        Continue For
                     End If
-                    Dim contact As Inventor.Point = contactPlate.Copy()
-                    contact.TransformBy(plateOcc.Transformation)
-                    ' Transform two points and subtract so a direction is not shifted by the plate origin.
-                    Dim originPt As Inventor.Point = tg.CreatePoint(0, 0, 0)
-                    Dim tipPt As Inventor.Point = tg.CreatePoint(outwardPart.X, outwardPart.Y, outwardPart.Z)
-                    originPt.TransformBy(plateOcc.Transformation)
-                    tipPt.TransformBy(plateOcc.Transformation)
-                    Dim dirX As Double = tipPt.X - originPt.X
-                    Dim dirY As Double = tipPt.Y - originPt.Y
-                    Dim dirZ As Double = tipPt.Z - originPt.Z
-                    Dim dirLen As Double = System.Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ)
-                    If dirLen < 0.000000001 Then Throw New System.Exception("The plate transform has no direction for the washer.")
-                    Dim outwardAsm As Inventor.UnitVector = tg.CreateUnitVector(dirX / dirLen, dirY / dirLen, dirZ / dirLen)
                     action = "building the washer position"
                     Dim matrix As Inventor.Matrix = MGHWasherMatrix(app, model, contact, outwardAsm)
                     action = "adding the washer to the assembly"
@@ -2364,7 +2423,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     Dim warning As String = ""
                     Try
                         If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
-                            warning = MGHConstrainWasher(app, asm, plateOcc, washerOcc, holeEdge, model, contact, outwardAsm)
+                            warning = MGHConstrainWasher(app, asm, rim.Component, washerOcc, holeEdge, model, contact, outwardAsm)
                         Else
                             Try
                                 washerOcc.Grounded = True
@@ -2384,7 +2443,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         MGHPutAttr(aset, "Role", "Washer")
                         MGHPutAttr(aset, "Size", sizeName)
                         MGHPutAttr(aset, "Center", centerText)
-                        MGHPutAttr(aset, "Side", If(onSelectedFace, "Selected", "Opposite"))
+                        MGHPutAttr(aset, "Side", If(onSelectedRim, "Selected", "Opposite"))
                         MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
                     Catch
                         notes.Add(sizeName & " washer at " & centerText & " is placed, but its identity could not be stored on the assembly.")
