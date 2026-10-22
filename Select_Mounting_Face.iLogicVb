@@ -340,7 +340,7 @@ Public Class SMFFaceSelector
         If completed OrElse JustSelectedEntities Is Nothing Then Exit Sub
         Dim chosen As Inventor.Face = Nothing
         For Each ent As Object In JustSelectedEntities
-            chosen = SMFFaceFromSelection(ent, target)
+            chosen = FaceOnThisPart(ent)
             If chosen IsNot Nothing Then Exit For
         Next
         If chosen Is Nothing Then
@@ -386,6 +386,24 @@ Public Class SMFFaceSelector
             completed = True
         End If
     End Sub
+
+    Private Function FaceOnThisPart(ent As Object) As Inventor.Face
+        If ent Is Nothing OrElse target Is Nothing Then Return Nothing
+        Dim face As Inventor.Face = TryCast(ent, Inventor.Face)
+        If face Is Nothing Then
+            Dim proxy As Inventor.FaceProxy = TryCast(ent, Inventor.FaceProxy)
+            If proxy IsNot Nothing Then face = proxy.NativeObject
+        End If
+        If face Is Nothing Then Return Nothing
+        Try
+            Dim ownerDef As Inventor.ComponentDefinition = TryCast(face.SurfaceBody.Parent, Inventor.ComponentDefinition)
+            If ownerDef Is Nothing OrElse ownerDef.Document Is Nothing Then Return Nothing
+            If Not String.Equals(ownerDef.Document.FullFileName, target.FullFileName, System.StringComparison.OrdinalIgnoreCase) Then Return Nothing
+        Catch
+            Return Nothing
+        End Try
+        Return face
+    End Function
 End Class
 
 Function SMFDefaultHardwareFolder() As String
@@ -467,24 +485,6 @@ Function SMFFindOpenDocument(app As Inventor.Application, path As String) As Inv
         End Try
     Next
     Return Nothing
-End Function
-
-Function SMFFaceFromSelection(ent As Object, part As Inventor.PartDocument) As Inventor.Face
-    If ent Is Nothing OrElse part Is Nothing Then Return Nothing
-    Dim face As Inventor.Face = TryCast(ent, Inventor.Face)
-    If face Is Nothing Then
-        Dim proxy As Inventor.FaceProxy = TryCast(ent, Inventor.FaceProxy)
-        If proxy IsNot Nothing Then face = proxy.NativeObject
-    End If
-    If face Is Nothing Then Return Nothing
-    Try
-        Dim ownerDef As Inventor.ComponentDefinition = TryCast(face.SurfaceBody.Parent, Inventor.ComponentDefinition)
-        If ownerDef Is Nothing OrElse ownerDef.Document Is Nothing Then Return Nothing
-        If Not String.Equals(ownerDef.Document.FullFileName, part.FullFileName, System.StringComparison.OrdinalIgnoreCase) Then Return Nothing
-    Catch
-        Return Nothing
-    End Try
-    Return face
 End Function
 
 Function SMFCustomProperties(doc As Inventor.Document) As Inventor.PropertySet
