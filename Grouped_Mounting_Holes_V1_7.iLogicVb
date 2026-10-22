@@ -1634,7 +1634,18 @@ Public Class MGHWasherModel
     Public InnerRadius As Double
     Public BearingEdge As Inventor.Edge
     Public Part As Inventor.PartDocument
+    Public FilePath As String
 End Class
+
+' Assembly attribute sets reject CopyWithOwner on some files. Try both flags.
+Function MGHEnsureAttributeSet(sets As Inventor.AttributeSets, name As String) As Inventor.AttributeSet
+    If sets.NameIsUsed(name) Then Return sets.Item(name)
+    Try
+        Return sets.Add(name, False)
+    Catch
+    End Try
+    Return sets.Add(name, True)
+End Function
 
 Function MGHReadHardwareLibrary(doc As Inventor.Document) As String
     Try
@@ -1648,12 +1659,7 @@ End Function
 Sub MGHWriteHardwareLibrary(doc As Inventor.Document, path As String)
     If doc Is Nothing OrElse path Is Nothing Then Return
     If path.Length = 0 OrElse path.Length > 255 Then Return
-    Dim aset As Inventor.AttributeSet
-    If doc.AttributeSets.NameIsUsed("MGH_Settings") Then
-        aset = doc.AttributeSets.Item("MGH_Settings")
-    Else
-        aset = doc.AttributeSets.Add("MGH_Settings", True)
-    End If
+    Dim aset As Inventor.AttributeSet = MGHEnsureAttributeSet(doc.AttributeSets, "MGH_Settings")
     MGHPutAttr(aset, "HardwareLibrary", path)
 End Sub
 
@@ -1934,6 +1940,7 @@ Function MGHReadWasher(app As Inventor.Application, path As String) As MGHWasher
     model.MidY = model.BearingY + model.AxisY * model.Thickness / 2.0
     model.MidZ = model.BearingZ + model.AxisZ * model.Thickness / 2.0
     model.BearingEdge = bearingEdge
+    model.FilePath = path
     Return model
 End Function
 
@@ -1960,8 +1967,8 @@ Function MGHWasherSitsOutside(occ As Inventor.ComponentOccurrence, model As MGHW
     Return signed > model.Thickness * 0.2
 End Function
 
-Sub MGHSetWasherMatrix(app As Inventor.Application, occ As Inventor.ComponentOccurrence, model As MGHWasherModel, _
-    contact As Inventor.Point, outward As Inventor.UnitVector)
+Function MGHWasherMatrix(app As Inventor.Application, model As MGHWasherModel, _
+    contact As Inventor.Point, outward As Inventor.UnitVector) As Inventor.Matrix
     Dim fxx As Double, fxy As Double, fxz As Double, fyx As Double, fyy As Double, fyz As Double
     Dim txx As Double, txy As Double, txz As Double, tyx As Double, tyy As Double, tyz As Double
     MGHWasherBasis(model.AxisX, model.AxisY, model.AxisZ, fxx, fxy, fxz, fyx, fyy, fyz)
@@ -1975,8 +1982,53 @@ Sub MGHSetWasherMatrix(app As Inventor.Application, occ As Inventor.ComponentOcc
         contact, _
         tg.CreateVector(txx, txy, txz), tg.CreateVector(tyx, tyy, tyz), _
         tg.CreateVector(outward.X, outward.Y, outward.Z))
-    occ.Transformation = matrix
-End Sub
+    Return matrix
+End Function
+
+' The washer file is already open from the geometry read. Adding it by that
+' definition avoids a second open, which raises E_FAIL inside an iLogic rule.
+Function MGHAddWasherOccurrence(asm As Inventor.AssemblyDocument, model As MGHWasherModel, _
+    matrix As Inventor.Matrix) As Inventor.ComponentOccurrence
+    Dim added As Inventor.ComponentOccurrence = Nothing
+    If model.Part IsNot Nothing Then
+        Try
+            added = asm.ComponentDefinition.Occurrences.AddByComponentDefinition(model.Part.ComponentDefinition, matrix)
+        Catch
+            added = Nothing
+        End Try
+    End If
+    If added IsNot Nothing Then Return added
+    Dim filePath As String = model.FilePath
+    If (filePath Is Nothing OrElse filePath = "") AndAlso model.Part IsNot Nothing Then filePath = model.Part.FullFileName
+    If filePath Is Nothing OrElse filePath = "" Then Throw New System.Exception("the washer file path is missing")
+    Try
+        Return asm.ComponentDefinition.Occurrences.Add(filePath, matrix)
+    Catch firstAdd As System.Exception
+        ' Close only a hidden part this rule opened. A washer the user already
+        ' has on screen keeps its window and any unsaved edits.
+        Dim hidden As Boolean = False
+        If model.Part IsNot Nothing Then
+            Try
+                hidden = model.Part.Views.Count = 0
+            Catch
+                hidden = False
+            End Try
+        End If
+        If hidden Then
+            Try
+                model.Part.Close(True)
+            Catch
+            End Try
+            model.Part = Nothing
+            model.BearingEdge = Nothing
+        End If
+        Try
+            Return asm.ComponentDefinition.Occurrences.Add(filePath, matrix)
+        Catch
+            Throw New System.Exception("while adding the washer to the assembly (" & firstAdd.Message & ")")
+        End Try
+    End Try
+End Function
 
 Function MGHParseStoredPoint(app As Inventor.Application, text As String) As Inventor.Point
     If text Is Nothing OrElse text = "" Then Return Nothing
@@ -1992,6 +2044,17 @@ End Function
 Function MGHFormatPoint(point As Inventor.Point) As String
     Dim culture As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
     Return point.X.ToString("0.000000", culture) & "," & point.Y.ToString("0.000000", culture) & "," & point.Z.ToString("0.000000", culture)
+End Function
+
+' A placed washer is named "MGH Washer #4 [x,y,z]" so a later run can replace it
+' even when the assembly refuses to store attributes.
+Function MGHCenterTextFromWasherName(name As String) As String
+    If name Is Nothing OrElse name = "" Then Return ""
+    If Not name.StartsWith("MGH Washer ", System.StringComparison.OrdinalIgnoreCase) Then Return ""
+    Dim openAt As Integer = name.LastIndexOf("["c)
+    Dim closeAt As Integer = name.LastIndexOf("]"c)
+    If openAt < 0 OrElse closeAt <= openAt Then Return ""
+    Return name.Substring(openAt + 1, closeAt - openAt - 1).Trim()
 End Function
 
 Function MGHUniqueOccurrenceName(occs As Inventor.ComponentOccurrences, requested As String) As String
@@ -2016,10 +2079,29 @@ Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.Assembl
     For Each occ As Inventor.ComponentOccurrence In asm.ComponentDefinition.Occurrences
         Try
             If keep IsNot Nothing AndAlso occ Is keep Then Continue For
-            If Not occ.AttributeSets.NameIsUsed("MGH_Hardware") Then Continue For
-            Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
-            If Not String.Equals(MGHGetAttr(aset, "Role"), "Washer", System.StringComparison.Ordinal) Then Continue For
-            Dim stored As Inventor.Point = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
+            Dim stored As Inventor.Point = Nothing
+            Dim sawOtherRole As Boolean = False
+            Try
+                If occ.AttributeSets.NameIsUsed("MGH_Hardware") Then
+                    Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
+                    If Not String.Equals(MGHGetAttr(aset, "Role"), "Washer", System.StringComparison.Ordinal) Then
+                        sawOtherRole = True
+                    Else
+                        stored = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
+                    End If
+                End If
+            Catch
+            End Try
+            If sawOtherRole Then Continue For
+            If stored Is Nothing Then
+                Dim occName As String = ""
+                Try
+                    occName = occ.Name
+                Catch
+                    occName = ""
+                End Try
+                stored = MGHParseStoredPoint(app, MGHCenterTextFromWasherName(occName))
+            End If
             If stored Is Nothing Then Continue For
             For Each center As Inventor.Point In centers
                 If stored.DistanceTo(center) < 0.005 Then
@@ -2105,7 +2187,10 @@ Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.Assembl
             washerOcc.Transformation = washerSaved
         Catch
         End Try
-        washerOcc.Grounded = True
+        Try
+            washerOcc.Grounded = True
+        Catch
+        End Try
         If plateMoved Then Return "grounded so the plate would not move"
         Return "positioned and grounded because the insert constraint did not seat it"
     End If
@@ -2220,13 +2305,23 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             For Each center As Inventor.Point In g.Centers
                 Dim washerOcc As Inventor.ComponentOccurrence = Nothing
                 Dim kept As Boolean = False
+                Dim action As String = "finding the hole rim"
                 Try
                     app.StatusBarText = "Placing " & sizeName & " washer"
-                    Dim holeEdge As Inventor.Edge = MGHFindHoleRim(plateDef, center, outwardPlate, onSelectedFace)
+                    Dim holeEdge As Inventor.Edge = Nothing
+                    Try
+                        holeEdge = MGHFindHoleRim(plateDef, center, outwardPlate, onSelectedFace)
+                    Catch rimEx As System.Exception
+                        If Not onSelectedFace Then
+                            notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far side of the hole was not found (" & rimEx.Message & ").")
+                            Continue For
+                        End If
+                    End Try
                     If holeEdge Is Nothing AndAlso Not onSelectedFace Then
                         notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " was skipped because the far side of the hole was not found.")
                         Continue For
                     End If
+                    action = "preparing the washer position"
                     Dim contactPlate As Inventor.Point
                     Dim outwardPart As Inventor.UnitVector
                     If onSelectedFace Then
@@ -2255,34 +2350,52 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     Dim dirLen As Double = System.Math.Sqrt(dirX * dirX + dirY * dirY + dirZ * dirZ)
                     If dirLen < 0.000000001 Then Throw New System.Exception("The plate transform has no direction for the washer.")
                     Dim outwardAsm As Inventor.UnitVector = tg.CreateUnitVector(dirX / dirLen, dirY / dirLen, dirZ / dirLen)
-                    washerOcc = asm.ComponentDefinition.Occurrences.Add(model.Part.FullFileName, tg.CreateMatrix())
-                    MGHSetWasherMatrix(app, washerOcc, model, contact, outwardAsm)
+                    action = "building the washer position"
+                    Dim matrix As Inventor.Matrix = MGHWasherMatrix(app, model, contact, outwardAsm)
+                    action = "adding the washer to the assembly"
+                    washerOcc = MGHAddWasherOccurrence(asm, model, matrix)
+                    kept = True
+                    placed += 1
+                    Dim centerText As String = MGHFormatPoint(center)
                     Try
-                        washerOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Washer " & sizeName)
+                        washerOcc.Name = MGHUniqueOccurrenceName(asm.ComponentDefinition.Occurrences, "MGH Washer " & sizeName & " [" & centerText & "]")
                     Catch
                     End Try
                     Dim warning As String = ""
-                    If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
-                        warning = MGHConstrainWasher(app, asm, plateOcc, washerOcc, holeEdge, model, contact, outwardAsm)
-                    Else
-                        washerOcc.Grounded = True
-                        warning = "positioned and grounded because a circular rim was not found"
-                    End If
-                    Dim aset As Inventor.AttributeSet = washerOcc.AttributeSets.Add("MGH_Hardware", True)
-                    MGHPutAttr(aset, "Role", "Washer")
-                    MGHPutAttr(aset, "Size", sizeName)
-                    MGHPutAttr(aset, "Center", MGHFormatPoint(center))
-                    MGHPutAttr(aset, "Side", If(onSelectedFace, "Selected", "Opposite"))
-                    MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
+                    Try
+                        If holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
+                            warning = MGHConstrainWasher(app, asm, plateOcc, washerOcc, holeEdge, model, contact, outwardAsm)
+                        Else
+                            Try
+                                washerOcc.Grounded = True
+                            Catch
+                            End Try
+                            warning = "positioned and grounded because a circular rim was not found"
+                        End If
+                    Catch constrainEx As System.Exception
+                        notes.Add(sizeName & " washer at " & centerText & " is placed, but constraining it failed: " & constrainEx.Message)
+                        Try
+                            washerOcc.Grounded = True
+                        Catch
+                        End Try
+                    End Try
+                    Try
+                        Dim aset As Inventor.AttributeSet = MGHEnsureAttributeSet(washerOcc.AttributeSets, "MGH_Hardware")
+                        MGHPutAttr(aset, "Role", "Washer")
+                        MGHPutAttr(aset, "Size", sizeName)
+                        MGHPutAttr(aset, "Center", centerText)
+                        MGHPutAttr(aset, "Side", If(onSelectedFace, "Selected", "Opposite"))
+                        MGHPutAttr(aset, "Source", System.IO.Path.GetFileName(chosen(sizeName)))
+                    Catch
+                        notes.Add(sizeName & " washer at " & centerText & " is placed, but its identity could not be stored on the assembly.")
+                    End Try
                     Dim oneCenter As New System.Collections.Generic.List(Of Inventor.Point)()
                     oneCenter.Add(center)
                     Try
                         replaced += MGHRemoveWashersAt(app, asm, oneCenter, washerOcc)
                     Catch
-                        notes.Add("The previous washer at " & MGHFormatPoint(center) & " could not be removed.")
+                        notes.Add("The previous washer at " & centerText & " could not be removed.")
                     End Try
-                    kept = True
-                    placed += 1
                     If warning <> "" Then notes.Add(sizeName & " washer " & washerOcc.Name & " was " & warning & ".")
                 Catch ex As System.Exception
                     If washerOcc IsNot Nothing AndAlso Not kept Then
@@ -2291,7 +2404,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         Catch
                         End Try
                     End If
-                    notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " failed: " & ex.Message)
+                    notes.Add(sizeName & " washer at " & MGHFormatPoint(center) & " failed while " & action & ": " & ex.Message)
                 End Try
             Next
         Next
