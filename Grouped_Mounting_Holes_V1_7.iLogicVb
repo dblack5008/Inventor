@@ -23,6 +23,8 @@
 ' Holes that need a different length get their own screw. The file window opens Hardware\<size>\Screws\<length>Lg.
 ' Placed hardware keeps the part file's own name in the assembly browser.
 ' The hole review can place hardware without cutting or changing the plate holes.
+' A hole already in the plate is recognized. Hardware is placed on it, and that location is not cut again.
+' Countersink, counterbore, and spotface holes use the review diameters. They are not linked to Clearance.xls.
 ' Sketch and feature naming are collision-resistant and non-fatal if Inventor rejects a rename.
 ' Default recommendations skip odd fastener numbers after #3.
 ' All numbered fasteners (#5/#7/#9/#11 included) remain available for manual selection.
@@ -122,8 +124,16 @@ Sub Main()
             inPlate.TransformBy(invertPlate)
             Dim onPlane As Inventor.Point = ProjectToPlane(inPlate, platePlane, app)
             Dim nearest As Inventor.Point = plateNativeFace.GetClosestPointTo(onPlane)
-            If nearest.DistanceTo(onPlane) > 0.003 Then ' 0.03 mm, Inventor internal cm
-                Throw New System.Exception("Projected center is outside plate face or within an existing opening.")
+            Dim distanceToFace As Double = nearest.DistanceTo(onPlane)
+            Dim existingOpening As Boolean = False
+            If distanceToFace > 0.003 Then ' 0.03 mm, Inventor internal cm
+                ' A center that falls in a hole already in the plate is still a valid
+                ' hardware location. Only a center outside the plate outline is rejected.
+                Dim rimGap As Double = MGHNearestCircularCenterGap(plateNativeFace, onPlane)
+                If Not MGHAcceptExistingOpening(distanceToFace, rimGap) Then
+                    Throw New System.Exception("Projected center is outside the plate face.")
+                End If
+                existingOpening = True
             End If
             Dim alreadySelected As Boolean = False
             For Each prior As MountPoint In selected
@@ -149,6 +159,7 @@ Sub Main()
             rimRec.AxisZ = measuredAxis.Z
             rimRec.Radius = radiusCm
             rec.Rim = rimRec
+            rec.ExistingOpening = existingOpening
             selected.Add(rec)
         Catch ex As System.Exception
             excluded.Add("Skipped selection " & (selected.Count + excluded.Count + 1).ToString() & ": " & ex.Message)
@@ -182,6 +193,7 @@ Sub Main()
         End If
         buckets(key).Centers.Add(m.Center)
         buckets(key).Rims.Add(m.Rim)
+        buckets(key).ExistingOpening.Add(m.ExistingOpening)
     Next
 
     ' Restore saved group names before the review grid is built. The grid's
@@ -267,8 +279,16 @@ Sub Main()
                 g.ClearanceStandard = b.ClearanceStandard : g.ClearanceFamily = b.ClearanceFamily
                 desiredGroups.Add(key, g)
             End If
-            For Each p As Inventor.Point In b.Centers
+            Dim centerIndex As Integer
+            For centerIndex = 0 To b.Centers.Count - 1
+                Dim p As Inventor.Point = b.Centers(centerIndex)
                 desiredGroups(key).Centers.Add(p)
+                Dim opening As Boolean = centerIndex < b.ExistingOpening.Count AndAlso b.ExistingOpening(centerIndex)
+                If opening Then
+                    desiredGroups(key).OpeningCenters.Add(p)
+                Else
+                    desiredGroups(key).CentersToCut.Add(p)
+                End If
             Next
             For Each rim As MGHComponentRim In b.Rims
                 desiredGroups(key).Rims.Add(rim)
@@ -315,6 +335,7 @@ Sub Main()
                 reviewOperation = "Checking " & g.Label & " — location " & (allLocations.Count + 1).ToString()
                 MGHProgressMessage(reviewProgress, app, reviewOperation)
                 For Each perimeter As Inventor.Edge In plateNativeFace.Edges
+                    If MGHGroupUsesOpening(g, pos) AndAlso MGHEdgeCenteredOn(perimeter, pos, 0.08) Then Continue For
                     Dim onEdge As Inventor.Point = perimeter.GetClosestPointTo(pos)
                     If onEdge.DistanceTo(pos) + 0.0001 < radius Then
                         Throw New System.Exception("Hole/seat '" & g.Label & "' envelope would intersect plate-face boundary or opening.")
@@ -345,15 +366,27 @@ Sub Main()
         End If
     End Try
 
-    If review.SkipHoleCreation Then
+    Dim cutsRequested As Integer = 0
+    Dim openingsReused As Integer = 0
+    For Each countedGroup As OutputGroup In desiredGroups.Values
+        cutsRequested += countedGroup.CentersToCut.Count
+        openingsReused += countedGroup.OpeningCenters.Count
+    Next
+    If review.SkipHoleCreation OrElse cutsRequested = 0 Then
         Dim hardwareOnlySummary As String = ""
         Try
             hardwareOnlySummary = MGHPlaceWashers(app, aDoc, desiredGroups, plateOcc, plateOutX, plateOutY, plateOutZ)
         Catch washerEx As System.Exception
             hardwareOnlySummary = "Hardware was not placed." & vbCrLf & washerEx.Message
         End Try
+        Dim holeLead As String
+        If review.SkipHoleCreation Then
+            holeLead = "Holes were left unchanged on " & plateDoc.DisplayName & "."
+        Else
+            holeLead = "The plate already has a hole at each selected location (" & openingsReused.ToString() & "). Those holes were left unchanged on " & plateDoc.DisplayName & "."
+        End If
         System.Windows.Forms.MessageBox.Show( _
-            "Holes were left unchanged on " & plateDoc.DisplayName & "." & vbCrLf & vbCrLf & _
+            holeLead & vbCrLf & vbCrLf & _
             hardwareOnlySummary & vbCrLf & vbCrLf & _
             "Inspect the hardware clearances, then SAVE the assembly.", _
             "Grouped Mounting Holes")
@@ -396,6 +429,7 @@ Sub Main()
         ' SurfaceBody.IsPointInside to verify WHICH DIRECTION ENTERS THE SOLID.
         ' Do NOT assume kNegative is the right direction and do NOT use COM success
         ' as evidence a Hole feature removed material.
+        Dim createdFeatures As New System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature)(System.StringComparer.Ordinal)
         Dim newSketches As New System.Collections.Generic.Dictionary(Of String, Inventor.PlanarSketch)(System.StringComparer.Ordinal)
         Dim newCenters As New System.Collections.Generic.Dictionary(Of String, Inventor.ObjectCollection)(System.StringComparer.Ordinal)
         Dim inwardDirections As New System.Collections.Generic.Dictionary(Of String, Inventor.PartFeatureExtentDirectionEnum)(System.StringComparer.Ordinal)
@@ -413,7 +447,9 @@ Sub Main()
             preparationIndex += 1
             operationInfo = "Preparing group " & preparationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
             MGHProgressMessage(progress, app, operationInfo)
-            If existing.ContainsKey(g.Key) Then
+            If existing.ContainsKey(g.Key) AndAlso g.CentersToCut.Count = 0 Then
+                ' Every selected center already opens through the plate. Leave the feature alone.
+            ElseIf existing.ContainsKey(g.Key) Then
                 Dim feat As Inventor.HoleFeature = existing(g.Key)
                 If g.Mode = "Threaded" Then
                     If Not feat.Tapped Then Throw New System.Exception("Existing group should be threaded but is not: " & feat.Name)
@@ -427,13 +463,15 @@ Sub Main()
                         Throw New System.Exception("Existing group diameter differs: " & feat.Name & ". Check the feature and specifications.")
                     End If
                 End If
-                If g.Seat = "Countersink" Then MGHEnforceCountersink(feat, g)
+                ' Only a clearance-linked countersink needs its seat written back. A plain
+                ' countersink already has the review diameters, and rewriting it recomputes.
+                If g.Seat = "Countersink" AndAlso feat.IsClearanceHole Then MGHEnforceCountersink(feat, g)
                 MGHCheckExistingSeat(feat, g)
                 Dim pd As Inventor.SketchHolePlacementDefinition = TryCast(feat.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
                 If pd Is Nothing Then Throw New System.Exception("Existing matching feature is no longer sketch-based: " & feat.Name)
                 Dim existingSketch As Inventor.PlanarSketch = feat.Sketch
                 Dim pendingCenters As New System.Collections.Generic.List(Of Inventor.Point)()
-                For Each p As Inventor.Point In g.Centers
+                For Each p As Inventor.Point In g.CentersToCut
                     Dim p2 As Inventor.Point2d = existingSketch.ModelToSketchSpace(p)
                     Dim found As Boolean = False
                     For Each sp As Inventor.SketchPoint In pd.HoleCenterPoints
@@ -453,7 +491,7 @@ Sub Main()
                     ' may still have solid material beneath them. Test each center:
                     ' some centers might already be drilled and should be ignored.
                     Dim repairCenters As New System.Collections.Generic.List(Of Inventor.Point)()
-                    For Each center As Inventor.Point In g.Centers
+                    For Each center As Inventor.Point In g.CentersToCut
                         Try
                             Dim one As New System.Collections.Generic.List(Of Inventor.Point)()
                             one.Add(center)
@@ -468,7 +506,7 @@ Sub Main()
                         interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(existingSketch, plateBody, repairCenters, app))
                     End If
                 End If
-            Else
+            ElseIf g.CentersToCut.Count > 0 Then
                 operationInfo = "Creating sketch for group: " & g.Label
                 Dim sk As Inventor.PlanarSketch = plateDef.Sketches.Add(plateNativeFace, False)
                 newSketches.Add(g.Key, sk)
@@ -476,8 +514,8 @@ Sub Main()
                 ' Never rename in this preparation loop. On some assemblies
                 ' PlanarSketch.Name raises E_FAIL (e.g. name collision).
                 operationInfo = "Determining plate interior for new group: " & g.Label
-                inwardDirections.Add(g.Key, DetermineInwardDirection(sk, plateBody, g.Centers, app))
-                interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(sk, plateBody, g.Centers, app))
+                inwardDirections.Add(g.Key, DetermineInwardDirection(sk, plateBody, g.CentersToCut, app))
+                interiorTestPoints.Add(g.Key, MGHFindInteriorSamples(sk, plateBody, g.CentersToCut, app))
             End If
             MGHProgressTick(progress, app, "Prepared group " & preparationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label)
         Next
@@ -487,13 +525,13 @@ Sub Main()
         Dim generationIndex As Integer = 0
         For Each g As OutputGroup In desiredGroups.Values
             generationIndex += 1
-            If existing.ContainsKey(g.Key) Then Continue For
+            If existing.ContainsKey(g.Key) OrElse Not newSketches.ContainsKey(g.Key) Then Continue For
             operationInfo = "Building new group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
             MGHProgressMessage(progress, app, operationInfo)
             Dim sk As Inventor.PlanarSketch = newSketches(g.Key)
             Dim pts As Inventor.ObjectCollection = newCenters(g.Key)
             Dim addedInGroup As Integer = 0
-            For Each p As Inventor.Point In g.Centers
+            For Each p As Inventor.Point In g.CentersToCut
                 Dim p2 As Inventor.Point2d = sk.ModelToSketchSpace(p)
                 Dim sp As Inventor.SketchPoint = sk.SketchPoints.Add(p2, True)
                 sk.GeometricConstraints.AddGround(sp)
@@ -501,19 +539,16 @@ Sub Main()
                 newPoints += 1
                 addedInGroup += 1
                 MGHProgressTick(progress, app, "Group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & _
-                    ": " & g.Label & " - point " & addedInGroup.ToString() & "/" & g.Centers.Count.ToString())
+                    ": " & g.Label & " - point " & addedInGroup.ToString() & "/" & g.CentersToCut.Count.ToString())
             Next
-            operationInfo = "Drilling and verifying " & g.Label
+            operationInfo = "Drilling " & g.Label
             MGHProgressMessage(progress, app, operationInfo)
             Dim place As Inventor.SketchHolePlacementDefinition = holes.CreateSketchPlacementDefinition(pts)
             Dim h As Inventor.HoleFeature = MGHCreateGroupedFeature(holes, place, g, inwardDirections(g.Key))
             If h Is Nothing Then Throw New System.Exception("Inventor returned no Hole feature for " & g.Label)
-            ' Do NOT trust a successful API call: a feature can face away from the plate.
-            operationInfo = "Verifying through-all cut: " & g.Label
-            MGHProgressMessage(progress, app, operationInfo)
-            If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
-                flippedGroups += 1
-            End If
+            createdFeatures.Add(g.Key, h)
+            ' Cut direction is checked once, after every new feature exists, so a
+            ' countersink group does not recompute the part by itself.
             operationInfo = "Recording group identity: " & g.Label
             MGHPersistIdentity(h, g, holes, plateDef, sk, namingWarnings)
             newGroups += 1
@@ -525,7 +560,7 @@ Sub Main()
         generationIndex = 0
         For Each g As OutputGroup In desiredGroups.Values
             generationIndex += 1
-            If Not existing.ContainsKey(g.Key) Then Continue For
+            If Not existing.ContainsKey(g.Key) OrElse g.CentersToCut.Count = 0 Then Continue For
             operationInfo = "Checking existing group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label
             MGHProgressMessage(progress, app, operationInfo)
             Dim h As Inventor.HoleFeature = existing(g.Key)
@@ -544,10 +579,10 @@ Sub Main()
             Next
             Dim changed As Boolean = False
             Dim checkedInGroup As Integer = 0
-            For Each p As Inventor.Point In g.Centers
+            For Each p As Inventor.Point In g.CentersToCut
                 checkedInGroup += 1
                 MGHProgressTick(progress, app, "Group " & generationIndex.ToString() & "/" & desiredGroups.Count.ToString() & _
-                    ": " & g.Label & " - checking point " & checkedInGroup.ToString() & "/" & g.Centers.Count.ToString())
+                    ": " & g.Label & " - checking point " & checkedInGroup.ToString() & "/" & g.CentersToCut.Count.ToString())
                 Dim p2 As Inventor.Point2d = sk.ModelToSketchSpace(p)
                 Dim duplicate As Boolean = False
                 For Each existingPoint As Inventor.SketchPoint In placement.HoleCenterPoints
@@ -580,9 +615,6 @@ Sub Main()
                     MGHProgressMessage(progress, app, operationInfo)
                     MGHApplyClearanceInfo(holes, h, g)
                 End If
-                If MGHVerifyCutAndFlip(h, plateDoc, plateDef, interiorTestPoints(g.Key), app, progress, g.Label) Then
-                    flippedGroups += 1
-                End If
                 updatedGroups += 1
             End If
             If migrateLegacy.ContainsKey(g.Key) Then
@@ -599,18 +631,22 @@ Sub Main()
             Throw New System.Exception("Inventor reports one or more part features failed to recompute. " & _
                 "The transaction will be aborted; inspect the model/feature geometry.")
         End If
+        operationInfo = "Checking that each new hole removed material"
+        MGHProgressMessage(progress, app, operationInfo)
+        flippedGroups += MGHConfirmCutDirections(plateDoc, plateDef, desiredGroups, existing, createdFeatures, interiorTestPoints, app, progress)
         ' Recompute can cause native clearance tables to restore countersink
         ' dimensions. Reject the group if the saved model differs from user input.
         operationInfo = "Confirming countersink diameters and included angles after recompute"
         MGHProgressMessage(progress, app, operationInfo)
-        For Each checkFeat As Inventor.HoleFeature In holes
-            If checkFeat.AttributeSets.NameIsUsed("MGH_Generator") Then
-                Dim checkIdentity As MGHParsedKey = MGHReadIdentity(checkFeat.AttributeSets.Item("MGH_Generator"))
-                If checkIdentity IsNot Nothing AndAlso desiredGroups.ContainsKey(checkIdentity.SpecKey) Then
-                    Dim requested As OutputGroup = desiredGroups(checkIdentity.SpecKey)
-                    If requested.Seat="Countersink" Then MGHAssertCountersink(checkFeat,requested)
-                End If
+        For Each requested As OutputGroup In desiredGroups.Values
+            If requested.Seat <> "Countersink" Then Continue For
+            Dim checkFeat As Inventor.HoleFeature = Nothing
+            If createdFeatures.ContainsKey(requested.Key) Then
+                checkFeat = createdFeatures(requested.Key)
+            ElseIf existing.ContainsKey(requested.Key) AndAlso requested.CentersToCut.Count > 0 Then
+                checkFeat = existing(requested.Key)
             End If
+            If checkFeat IsNot Nothing Then MGHAssertCountersink(checkFeat, requested)
         Next
         MGHProgressTick(progress, app, "Final model recompute and countersink dimensions passed")
         operationInfo = "Committing the plate transaction"
@@ -636,6 +672,7 @@ Sub Main()
             "Groups whose cut direction was reversed: " & flippedGroups.ToString() & vbCrLf & _
             "New hole centers: " & newPoints.ToString() & vbCrLf & _
             "Duplicate centers skipped: " & skippedDuplicates.ToString() & vbCrLf & _
+            If(openingsReused = 0, "", "Existing plate holes kept: " & openingsReused.ToString() & vbCrLf) & _
             If(excluded.Count = 0, "", vbCrLf & "Selections skipped:" & vbCrLf & _
                 String.Join(vbCrLf, excluded.ToArray()) & vbCrLf) & _
             If(namingWarnings.Count = 0, "", vbCrLf & "Naming notes (geometry was created):" & vbCrLf & _
@@ -1098,12 +1135,14 @@ Public Class MountPoint
     Public SourceDiameterIn As Double
     Public SourceName As String
     Public Rim As MGHComponentRim
+    Public ExistingOpening As Boolean
 End Class
 
 Public Class InputBucket
     Public SourceKey As String
     Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
     Public Rims As New System.Collections.Generic.List(Of MGHComponentRim)()
+    Public ExistingOpening As New System.Collections.Generic.List(Of Boolean)()
     Public Screw As String
     Public Fit As String
     Public DiameterIn As Double
@@ -1140,6 +1179,9 @@ Public Class OutputGroup
     Public PlaneId As String
     Public Centers As New System.Collections.Generic.List(Of Inventor.Point)()
     Public Rims As New System.Collections.Generic.List(Of MGHComponentRim)()
+    ' Centers that still have plate material. OpeningCenters already have a hole.
+    Public CentersToCut As New System.Collections.Generic.List(Of Inventor.Point)()
+    Public OpeningCenters As New System.Collections.Generic.List(Of Inventor.Point)()
 End Class
 
 ' Parsed form of a feature's stored identity. SpecKey excludes the group name.
@@ -1389,7 +1431,7 @@ Function MGHDescribeExistingGroups(def As Inventor.PartComponentDefinition, _
             End If
         Else
             For Each item As MGHIndexedFeature In index.Items
-                If MGHSharesAnyCenter(item.Feature, g.Centers) Then
+                If MGHSharesAnyCenter(item.Feature, g.CentersToCut) Then
                     Throw New System.Exception(MGHSpecConflictMessage(item.Feature.Name, item.Label, g.Label))
                 End If
             Next
@@ -4032,8 +4074,11 @@ Function MGHCreateGroupedFeature(holes As Inventor.HoleFeatures,place As Invento
             Throw New System.Exception("Unrecognized seat: " & g.Seat)
     End Select
     If h Is Nothing Then Throw New System.Exception("Inventor did not return a hole feature for " & g.Label)
-    If g.Mode="Clearance" Then MGHApplyClearanceInfo(holes,h,g)
-    If g.Seat="Countersink" Then MGHEnforceCountersink(h,g)
+    ' Plain drilled clearance holes use the local table. A countersink, counterbore,
+    ' or spotface keeps the diameters from the review. Linking those seats to
+    ' Clearance.xls makes Inventor re-read the spreadsheet on every edit, which
+    ' takes minutes even for two or three holes.
+    If MGHLinkClearanceTable(g.Mode, g.Seat) Then MGHApplyClearanceInfo(holes,h,g)
     Return h
 End Function
 
@@ -4106,6 +4151,99 @@ Sub MGHCheckExistingSeat(h As Inventor.HoleFeature,g As OutputGroup)
                System.Math.Abs(h.SpotFaceDepth.Value-g.SeatDepthIn*2.54)>0.0002 Then Throw New System.Exception("Spotface dimensions changed: " & h.Name)
     End Select
 End Sub
+
+' True when the point misses the plate face and a circular rim is centered on it.
+' distance and rim gap are centimeters. A negative rim gap means no circular edge was found.
+Function MGHAcceptExistingOpening(distanceToFaceCm As Double, nearestRimCenterCm As Double) As Boolean
+    If distanceToFaceCm <= 0.003 Then Return False
+    If nearestRimCenterCm < 0 Then Return False
+    Return nearestRimCenterCm <= 0.08
+End Function
+
+' Plain clearance holes follow Clearance.xls. Seated holes keep the review diameters.
+Function MGHLinkClearanceTable(mode As String, seat As String) As Boolean
+    If mode Is Nothing OrElse seat Is Nothing Then Return False
+    Return String.Equals(mode, "Clearance", System.StringComparison.OrdinalIgnoreCase) AndAlso _
+           String.Equals(seat, "None", System.StringComparison.OrdinalIgnoreCase)
+End Function
+
+Function MGHNearestCircularCenterGap(face As Inventor.Face, point As Inventor.Point) As Double
+    Dim best As Double = -1
+    If face Is Nothing OrElse point Is Nothing Then Return -1
+    Try
+        For Each ed As Inventor.Edge In face.Edges
+            Dim edgeCenter As Inventor.Point = Nothing
+            Dim radius As Double = 0
+            If Not MGHCircularEdge(ed, edgeCenter, radius) Then Continue For
+            Dim gap As Double = edgeCenter.DistanceTo(point)
+            If best < 0 OrElse gap < best Then best = gap
+        Next
+    Catch
+    End Try
+    Return best
+End Function
+
+Function MGHGroupUsesOpening(group As OutputGroup, point As Inventor.Point) As Boolean
+    If group Is Nothing OrElse group.OpeningCenters Is Nothing OrElse point Is Nothing Then Return False
+    For Each opening As Inventor.Point In group.OpeningCenters
+        If opening IsNot Nothing AndAlso opening.DistanceTo(point) < 0.005 Then Return True
+    Next
+    Return False
+End Function
+
+Function MGHEdgeCenteredOn(edge As Inventor.Edge, point As Inventor.Point, toleranceCm As Double) As Boolean
+    Dim edgeCenter As Inventor.Point = Nothing
+    Dim radius As Double = 0
+    If point Is Nothing OrElse Not MGHCircularEdge(edge, edgeCenter, radius) Then Return False
+    Return edgeCenter.DistanceTo(point) <= toleranceCm
+End Function
+
+' The part has already been recomputed. Flip any hole that is still solid at its
+' sample, then recompute once for the whole plate if any hole was flipped.
+Function MGHConfirmCutDirections(doc As Inventor.PartDocument, def As Inventor.PartComponentDefinition, _
+    groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup), _
+    existing As System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature), _
+    created As System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature), _
+    samples As System.Collections.Generic.Dictionary(Of String, System.Collections.Generic.List(Of Inventor.Point)), _
+    app As Inventor.Application, pb As Inventor.ProgressBar) As Integer
+    Dim flipped As Integer = 0
+    Dim pending As New System.Collections.Generic.List(Of String)()
+    For Each g As OutputGroup In groups.Values
+        If g Is Nothing OrElse Not samples.ContainsKey(g.Key) Then Continue For
+        Dim feat As Inventor.HoleFeature = Nothing
+        If created IsNot Nothing AndAlso created.ContainsKey(g.Key) Then
+            feat = created(g.Key)
+        ElseIf existing IsNot Nothing AndAlso existing.ContainsKey(g.Key) Then
+            feat = existing(g.Key)
+        End If
+        If feat Is Nothing Then Continue For
+        If Not MGHStillSolid(def, samples(g.Key)) Then Continue For
+        MGHProgressMessage(pb, app, "First direction missed material - reversing " & g.Label)
+        Dim currentExtent As Inventor.ThroughAllExtent = TryCast(feat.Extent, Inventor.ThroughAllExtent)
+        If currentExtent Is Nothing Then Throw New System.Exception("Hole '" & g.Label & "' did not have a Through All extent.")
+        feat.SetThroughAllExtent(MGHOppositeDirection(currentExtent.Direction))
+        pending.Add(g.Key)
+        flipped += 1
+    Next
+    If pending.Count = 0 Then Return 0
+    If Not doc.Update2(False) Then
+        Throw New System.Exception("Part update failed after reversing a hole cut direction.")
+    End If
+    For Each key As String In pending
+        Dim label As String = key
+        For Each g As OutputGroup In groups.Values
+            If String.Equals(g.Key, key, System.StringComparison.Ordinal) Then
+                label = g.Label
+                Exit For
+            End If
+        Next
+        If MGHStillSolid(def, samples(key)) Then
+            Throw New System.Exception("Neither cut direction removed material at ALL selected positions for '" & _
+                label & "'. Transaction will be aborted; inspect the selected plate face and geometry.")
+        End If
+    Next
+    Return flipped
+End Function
 
 ' Return the correct through-all direction by probing the actual solid on
 ' both sides of the SKETCH normal. Sketch normal, not face/camera normal,
@@ -4415,7 +4553,7 @@ Public Class HoleReviewForm
     Public Sub New(buckets As System.Collections.Generic.SortedDictionary(Of String, InputBucket))
         MyBase.New()
         items = buckets
-        Me.Width = 1510 : Me.Height = 640
+        Me.Width = 1510 : Me.Height = 660
         Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
         Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.Sizable
         Dim heading As New System.Windows.Forms.Label()
@@ -4459,24 +4597,24 @@ Public Class HoleReviewForm
         grd.Columns.Add(New System.Windows.Forms.DataGridViewTextBoxColumn() With {.Name="ClearanceFamily", .HeaderText="Clearance fastener family", .Width=240})
         Me.Controls.Add(grd)
         Dim note As New System.Windows.Forms.Label()
-        note.Left=12 : note.Top=456 : note.Width=1465 : note.Height=88
+        note.Left=12 : note.Top=456 : note.Width=1465 : note.Height=104
         note.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Left Or System.Windows.Forms.AnchorStyles.Right
         note.Text = "Clearance uses local Inventor Clearance.xls (diameter preview is approximate); Threaded uses Thread.xls (pilot Ø determined by table). " & _
                     "For a custom/PEM hole choose Custom/Press-Fit and enter EXACT Ø. Seats: Counterbore/Spotface need Ø + depth; Countersink needs exact Ø and dropdown angle (82° default, 100° optional). For native clearance, edit the clearance-family column to match local table/head style. " & _
-                    "Place hardware only skips hole creation and places washers, nuts, and screws on the holes you already selected."
+                    "Place hardware only skips hole creation and places washers, nuts, and screws on the holes you already selected. A hole already in the plate is kept and used for hardware."
         Me.Controls.Add(note)
         Dim hardwareOnly As New System.Windows.Forms.Button()
-        hardwareOnly.Text = "Place hardware only" : hardwareOnly.Width = 170 : hardwareOnly.Left = 996 : hardwareOnly.Top = 548
+        hardwareOnly.Text = "Place hardware only" : hardwareOnly.Width = 170 : hardwareOnly.Left = 996 : hardwareOnly.Top = 568
         hardwareOnly.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
         AddHandler hardwareOnly.Click, AddressOf HardwareOnlyClick
         Me.Controls.Add(hardwareOnly)
         Dim ok As New System.Windows.Forms.Button()
-        ok.Text="Generate holes" : ok.Width=150 : ok.Left=1310 : ok.Top=548
+        ok.Text="Generate holes" : ok.Width=150 : ok.Left=1310 : ok.Top=568
         ok.Anchor = System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
         AddHandler ok.Click, AddressOf AcceptClick
         Me.Controls.Add(ok)
         Dim cancel As New System.Windows.Forms.Button()
-        cancel.Text="Cancel" : cancel.Width=100 : cancel.Left=1178 : cancel.Top=548
+        cancel.Text="Cancel" : cancel.Width=100 : cancel.Left=1178 : cancel.Top=568
         cancel.Anchor= System.Windows.Forms.AnchorStyles.Bottom Or System.Windows.Forms.AnchorStyles.Right
         AddHandler cancel.Click, AddressOf CancelClick
         Me.Controls.Add(cancel)
