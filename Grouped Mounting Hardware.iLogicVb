@@ -1,4 +1,4 @@
-﻿' GROUPED MOUNTING HOLES - v1.7 (countersink 82/100 dropdown + exact seat verification) (Inventor 2027, assembly-level EXTERNAL iLogic rule)
+﻿' GROUPED MOUNTING HARDWARE (Inventor 2027, assembly-level EXTERNAL iLogic rule)
 ' Uses native part Hole features: one feature and one point sketch per unique hole specification.
 ' Operates on the part file referenced by the selected plate occurrence. DOES NOT move components.
 ' Select a planar plate face, then select circular hole rims on the mounted components.
@@ -38,7 +38,7 @@ Sub Main()
     Dim app As Inventor.Application = ThisApplication
     Dim aDoc As Inventor.AssemblyDocument = TryCast(app.ActiveDocument, Inventor.AssemblyDocument)
     If aDoc Is Nothing Then
-        System.Windows.Forms.MessageBox.Show("Open an .iam assembly before running this rule.", "Grouped Mounting Holes")
+        System.Windows.Forms.MessageBox.Show("Open an .iam assembly before running this rule.", "Grouped Mounting Hardware")
         Exit Sub
     End If
 
@@ -90,7 +90,7 @@ Sub Main()
     If plateToAssembly Is Nothing Then
         System.Windows.Forms.MessageBox.Show( _
             "The plate's position in this assembly could not be read, so no holes were created.", _
-            "Grouped Mounting Holes")
+            "Grouped Mounting Hardware")
         Exit Sub
     End If
     Dim invertPlate As Inventor.Matrix = plateToAssembly.Copy()
@@ -217,12 +217,12 @@ Sub Main()
     Try
         MGHApplyStoredLabels(buckets, plateDef, planeID)
     Catch ex As System.Exception
-        System.Windows.Forms.MessageBox.Show("Existing grouped holes could not be read:" & vbCrLf & ex.Message, "Grouped Mounting Holes")
+        System.Windows.Forms.MessageBox.Show("Existing grouped holes could not be read:" & vbCrLf & ex.Message, "Grouped Mounting Hardware")
         Exit Sub
     End Try
 
     Dim review As New HoleReviewForm(buckets)
-    review.Text = "Grouped Mounting Holes - " & plateDoc.DisplayName
+    review.Text = "Grouped Mounting Hardware - " & plateDoc.DisplayName
     Dim outcome As System.Windows.Forms.DialogResult = review.ShowDialog()
     If outcome <> System.Windows.Forms.DialogResult.OK Then Exit Sub
 
@@ -233,7 +233,7 @@ Sub Main()
     Dim desiredGroups As New System.Collections.Generic.SortedDictionary(Of String, OutputGroup)(System.StringComparer.Ordinal)
     Try
         Dim reviewSteps As Integer = 4 + buckets.Count + selected.Count
-        reviewProgress = app.CreateProgressBar(False, reviewSteps, "Grouped Mounting Holes - Reviewing / Validating")
+        reviewProgress = app.CreateProgressBar(False, reviewSteps, "Grouped Mounting Hardware - Reviewing / Validating")
         MGHProgressTick(reviewProgress, app, "Collecting selected mounting-hole specifications")
         For Each b As InputBucket In buckets.Values
             reviewOperation = "Validating specification for source Ø" & b.SourceKey
@@ -369,7 +369,7 @@ Sub Main()
         MGHProgressTick(reviewProgress, app, reviewOperation)
         MGHProgressTick(reviewProgress, app, "Validation finished")
     Catch ex As System.Exception
-        System.Windows.Forms.MessageBox.Show("Review validation failed: " & reviewOperation & vbCrLf & ex.Message, "Grouped Mounting Holes")
+        System.Windows.Forms.MessageBox.Show("Review validation failed: " & reviewOperation & vbCrLf & ex.Message, "Grouped Mounting Hardware")
         Exit Sub
     Finally
         If reviewProgress IsNot Nothing Then
@@ -403,7 +403,7 @@ Sub Main()
             holeLead & vbCrLf & vbCrLf & _
             hardwareOnlySummary & vbCrLf & vbCrLf & _
             "Inspect the hardware clearances, then SAVE the assembly.", _
-            "Grouped Mounting Holes")
+            "Grouped Mounting Hardware")
         Exit Sub
     End If
 
@@ -418,9 +418,9 @@ Sub Main()
         For Each gg As OutputGroup In desiredGroups.Values
             progressSteps += gg.Centers.Count
         Next
-        progress = app.CreateProgressBar(False, progressSteps, "Grouped Mounting Holes - Generating")
+        progress = app.CreateProgressBar(False, progressSteps, "Grouped Mounting Hardware - Generating")
         progress.Message = "Opening transaction for " & plateDoc.DisplayName
-        trans = app.TransactionManager.StartTransaction(plateDoc, "Generate Grouped Mounting Holes")
+        trans = app.TransactionManager.StartTransaction(plateDoc, "Generate Grouped Mounting Hardware")
         MGHProgressTick(progress, app, "Plate transaction started - checking existing groups")
         Dim holes As Inventor.HoleFeatures = plateDef.Features.HoleFeatures
         Dim featureIndex As MGHFeatureIndex = MGHLoadFeatureIndex(plateDef)
@@ -693,7 +693,7 @@ Sub Main()
                 String.Join(vbCrLf, namingWarnings.ToArray()) & vbCrLf) & vbCrLf & _
             washerSummary & vbCrLf & vbCrLf & _
             "Inspect the plate, dimensions, and hardware clearances, then SAVE the plate .ipt and assembly.", _
-            "Grouped Mounting Holes")
+            "Grouped Mounting Hardware")
     Catch ex As System.Exception
         If progress IsNot Nothing Then
             Try
@@ -711,7 +711,7 @@ Sub Main()
         System.Windows.Forms.MessageBox.Show( _
             "Hole creation failed; attempted to roll back the group transaction." & vbCrLf & _
             "Operation: " & operationInfo & vbCrLf & vbCrLf & _
-            ex.ToString(), "Grouped Mounting Holes - error")
+            ex.ToString(), "Grouped Mounting Hardware - error")
     End Try
 End Sub
 
@@ -792,7 +792,7 @@ Public Class MGHInteractionSelector
         Catch ex As System.Exception
             System.Windows.Forms.MessageBox.Show( _
                 "Selection could not be completed:" & vbCrLf & ex.Message, _
-                "Grouped Mounting Holes - selection error")
+                "Grouped Mounting Hardware - selection error")
             Return False
         Finally
             completed = True
@@ -3279,7 +3279,7 @@ Function MGHChooseRoleFile(app As Inventor.Application, library As String, sizeN
             "No " & roleFolder & " folder was found for " & sizeName & "." & vbCrLf & _
             "Expected: " & expected & vbCrLf & _
             "The file window will open at the hardware folder so you can browse to the part.", _
-            "Grouped Mounting Holes")
+            "Grouped Mounting Hardware")
         startDir = library
     End If
     Dim picked As String = MGHPickPartFile(app, "Select the " & sizeName & " " & roleLabel & " — " & startDir, startDir)
@@ -4127,7 +4127,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     Next
     If placeSteps < 1 Then placeSteps = 1
     Try
-        hardwareProgress = app.CreateProgressBar(False, placeSteps, "Grouped Mounting Holes - Placing Hardware")
+        hardwareProgress = app.CreateProgressBar(False, placeSteps, "Grouped Mounting Hardware - Placing Hardware")
     Catch
         hardwareProgress = Nothing
     End Try

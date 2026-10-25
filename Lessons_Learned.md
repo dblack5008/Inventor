@@ -1,6 +1,6 @@
 # Lessons Learned
 
-Notes from the Inventor 2027 external iLogic rules in this repository, mainly `Grouped_Mounting_Holes_V1_7.iLogicVb` and `Select_Mounting_Face.iLogicVb`. Each entry is an error we hit, why it failed, and what to do in the next script.
+Notes from the Inventor 2027 external iLogic rules in this repository, mainly `Grouped Mounting Hardware.iLogicVb` and `Select_Mounting_Face.iLogicVb`. Each entry is an error we hit, why it failed, and what to do in the next script.
 
 Inventor internal length is centimeters. Show inches as the centimeter value divided by `2.54`, and write parameter expressions with an explicit unit such as `"0.125 in"` so the document unit does not change the meaning.
 

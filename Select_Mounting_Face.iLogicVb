@@ -2,7 +2,7 @@
 ' Opens every .ipt under a folder, including sub-folders, and asks for the face
 ' that sits against the washer or the part. The face is saved in the part's
 ' custom iProperties "MGH Mounting Face" and "MGH Mounting Face Context".
-' Grouped Mounting Holes reads those properties and does not ask again.
+' Grouped Mounting Hardware reads those properties and does not ask again.
 ' Parts already carrying a face that still matches the model are skipped unless
 ' that option is turned off. Each finished part is saved and closed.
 ' Inventor backup folders named OldVersions are not opened.
