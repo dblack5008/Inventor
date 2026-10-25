@@ -2,7 +2,7 @@
 ' Uses native part Hole features: one feature and one point sketch per unique hole specification.
 ' Operates on the part file referenced by the selected plate occurrence. DOES NOT move components.
 ' Select a planar plate face, then select circular hole rims on the mounted components.
-' click FINISH SELECTION & REVIEW to finish (no ESC dependence). Clicked rims stay cyan while selecting.
+' Click a hole rim, or drag a box over hole edges. Click FINISH SELECTION & REVIEW to finish (no ESC dependence). Clicked rims stay cyan while selecting.
 ' Review groups, then commit. Inward direction is VERIFIED by checking that solid
 ' material is removed at EVERY selected hole center (and flipped if necessary).
 ' Native progress bars report both review/validation and hole generation.
@@ -94,7 +94,7 @@ Sub Main()
     Dim gotHoles As Boolean = holeSelector.Run( _
         app, Inventor.SelectionFilterEnum.kPartEdgeCircularFilter, _
         "Select Component Mounting Holes", _
-        "Click each circular hole rim on the mounted component. When finished, click FINISH SELECTION & REVIEW in the floating palette.", False)
+        "Click each circular hole rim, or drag a box over the hole edges. When finished, click FINISH SELECTION & REVIEW in the floating palette.", False)
     If Not gotHoles Then Exit Sub
 
     Dim selected As New System.Collections.Generic.List(Of MountPoint)()
@@ -741,6 +741,15 @@ Public Class MGHInteractionSelector
             oSelect = oInteraction.SelectEvents
             oSelect.AddSelectionFilter(filter)
             oSelect.SingleSelectEnabled = finishAfterFirst
+            ' Hole picking accepts a drag box as well as a click. The plate face
+            ' and the hardware mounting face stay one click.
+            If Not finishAfterFirst Then
+                Try
+                    oSelect.WindowSelectEnabled = True
+                    oSelect.AddWindowSelectionFilter(filter)
+                Catch
+                End Try
+            End If
 
             ' Keep ALL selected hole rims visibly highlighted during the session.
             ' HighlightSet is supported in assembly documents and works with proxies.
@@ -808,7 +817,11 @@ Public Class MGHInteractionSelector
         ' Use JustSelectedEntities directly: the event can fire before the
         ' SelectedEntities collection is fully refreshed in some versions.
         For Each ent As Object In JustSelectedEntities
-            If ent IsNot Nothing Then Picked.Add(ent)
+            If ent Is Nothing Then Continue For
+            If MGHSelectionAlreadyPicked(Picked, ent) Then Continue For
+            ' A box can cross arc edges of a countersink. Keep full circles only.
+            If highlightRims AndAlso Not MGHSelectionIsFullCircle(ent) Then Continue For
+            Picked.Add(ent)
         Next
         RefreshRimHighlight()
         If palette IsNot Nothing Then palette.SetSelectedCount(Picked.Count)
@@ -881,6 +894,31 @@ Public Class MGHInteractionSelector
         End If
     End Sub
 
+    Private Function MGHSelectionAlreadyPicked(items As System.Collections.Generic.List(Of Object), candidate As Object) As Boolean
+        If items Is Nothing OrElse candidate Is Nothing Then Return False
+        For Each known As Object In items
+            If known Is candidate Then Return True
+        Next
+        Return False
+    End Function
+
+    Private Function MGHSelectionIsFullCircle(ent As Object) As Boolean
+        Dim edge As Inventor.Edge = Nothing
+        Dim proxy As Inventor.EdgeProxy = TryCast(ent, Inventor.EdgeProxy)
+        If proxy IsNot Nothing Then
+            edge = proxy
+        Else
+            edge = TryCast(ent, Inventor.Edge)
+        End If
+        If edge Is Nothing Then Return False
+        Try
+            Dim circ As Inventor.Circle = TryCast(edge.Geometry, Inventor.Circle)
+            Return circ IsNot Nothing AndAlso circ.Radius > 0
+        Catch
+            Return False
+        End Try
+    End Function
+
     Private Sub UserFinished(sender As Object, e As System.EventArgs)
         If Picked.Count = 0 Then
             System.Windows.Forms.MessageBox.Show( _
@@ -911,45 +949,47 @@ Public Class MGHSelectionPalette
     Public Event FinishPressed As System.EventHandler
     Public Event CancelPressed As System.EventHandler
     Private countLabel As System.Windows.Forms.Label
+    Private multiPick As Boolean
 
     Public Sub New(caption As String, instructions As String, singlePick As Boolean)
         MyBase.New()
         Me.Text = caption
-        Me.Width = 475
-        Me.Height = 215
+        Me.Width = 490
+        Me.Height = 230
         Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
         Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedToolWindow
         Me.TopMost = True
         Me.ShowInTaskbar = False
         Me.MaximizeBox = False
         Me.MinimizeBox = False
+        multiPick = Not singlePick
 
         Dim directions As New System.Windows.Forms.Label()
         directions.Text = instructions
         directions.Left = 14 : directions.Top = 14
-        directions.Width = 440 : directions.Height = 65
+        directions.Width = 450 : directions.Height = 78
         Me.Controls.Add(directions)
 
         countLabel = New System.Windows.Forms.Label()
-        countLabel.Left = 14 : countLabel.Top = 84
-        countLabel.Width = 430 : countLabel.Height = 24
+        countLabel.Left = 14 : countLabel.Top = 96
+        countLabel.Width = 450 : countLabel.Height = 24
         If singlePick Then
             countLabel.Text = "Click the face. Cancel skips it."
         Else
-            countLabel.Text = "Selected: 0 (cyan = selected hole rim)"
+            countLabel.Text = "Selected: 0 (click a rim or drag a box)"
         End If
         Me.Controls.Add(countLabel)
 
         Dim cancelBtn As New System.Windows.Forms.Button()
         cancelBtn.Text = "Cancel Without Changes"
-        cancelBtn.Width = 165 : cancelBtn.Left = 14 : cancelBtn.Top = 117
+        cancelBtn.Width = 165 : cancelBtn.Left = 14 : cancelBtn.Top = 128
         AddHandler cancelBtn.Click, AddressOf CancelClick
         Me.Controls.Add(cancelBtn)
 
         If Not singlePick Then
             Dim finishBtn As New System.Windows.Forms.Button()
             finishBtn.Text = "Finish Selection && Review"
-            finishBtn.Width = 190 : finishBtn.Left = 265 : finishBtn.Top = 117
+            finishBtn.Width = 190 : finishBtn.Left = 270 : finishBtn.Top = 128
             AddHandler finishBtn.Click, AddressOf FinishClick
             Me.Controls.Add(finishBtn)
         End If
@@ -958,7 +998,11 @@ Public Class MGHSelectionPalette
     End Sub
 
     Public Sub SetSelectedCount(n As Integer)
-        countLabel.Text = "Selected: " & n.ToString()
+        If multiPick Then
+            countLabel.Text = "Selected: " & n.ToString() & " (click a rim or drag a box)"
+        Else
+            countLabel.Text = "Selected: " & n.ToString()
+        End If
     End Sub
 
     Private Sub FinishClick(sender As Object, e As System.EventArgs)
