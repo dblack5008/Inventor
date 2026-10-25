@@ -88,6 +88,14 @@ Inventor internal length is centimeters. Show inches as the centimeter value div
 
 **Next time.** If the projected center misses the face and a circular edge on that face is centered on the point, the plate already has a hole. Keep the location for hardware and do not cut it. If every selected location is already open, skip the plate transaction and place hardware. A center that misses the face and has no circular rim on it is actually outside the plate. Ignore a circular edge centered on the point when checking the new hole against the face boundary.
 
+## Subassemblies
+
+**Error.** `Version 1 requires the plate to be a TOP-LEVEL part in this assembly (not inside a subassembly).` The plate the user clicked was a real part. It lived inside a subassembly.
+
+**Why.** Selecting a face on a part that is nested in a subassembly returns a `FaceProxy` whose `ContainingOccurrence` is a `ComponentOccurrenceProxy`. The rule treated every proxy as unsupported and stopped before reading the part. The part document is still the `.ipt`, and a proxy obtained by picking in the open assembly reports its position in that assembly. Autodesk's assembly API states that `Transformation` on those proxies is already in the context of the assembly you picked in.
+
+**Next time.** Edit the part from `Occurrence.Definition` whether or not the occurrence is a proxy. Keep the proxy for constraints: `CreateGeometryProxy` on it returns geometry in the assembly where the constraint is created. Use the proxy transform to move plate-space points into that assembly, and its inverse to move clicked rims back into the part. Check the transform against points on the face that was clicked. If it does not land those points, multiply each occurrence's transform inside its own parent, from the part outward. If neither transform lands the points, stop before cutting. A top-level part is not a proxy; keep using its transform directly. Leave Grounded alone while choosing the transform. Grounding the nested part would edit the subassembly.
+
 ## Selection
 
 **Error.** Holes could only be picked one click at a time.

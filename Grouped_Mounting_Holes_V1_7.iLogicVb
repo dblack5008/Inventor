@@ -2,6 +2,8 @@
 ' Uses native part Hole features: one feature and one point sketch per unique hole specification.
 ' Operates on the part file referenced by the selected plate occurrence. DOES NOT move components.
 ' Select a planar plate face, then select circular hole rims on the mounted components.
+' The plate can be a top-level part or a part inside a subassembly. Holes are cut in that part file.
+' Hardware is placed in the open assembly.
 ' Click a hole rim, or drag a box over hole edges. Click FINISH SELECTION & REVIEW to finish (no ESC dependence). Clicked rims stay cyan while selecting.
 ' Review groups, then commit. Inward direction is VERIFIED by checking that solid
 ' material is removed at EVERY selected hole center (and flipped if necessary).
@@ -56,8 +58,8 @@ Sub Main()
     End If
 
     Dim plateOcc As Inventor.ComponentOccurrence = plateFaceProxy.ContainingOccurrence
-    If TypeOf plateOcc Is Inventor.ComponentOccurrenceProxy Then
-        System.Windows.Forms.MessageBox.Show("Version 1 requires the plate to be a TOP-LEVEL part in this assembly (not inside a subassembly).")
+    If plateOcc Is Nothing Then
+        System.Windows.Forms.MessageBox.Show("Select a planar face belonging to an actual plate part occurrence.")
         Exit Sub
     End If
     Dim plateDef As Inventor.PartComponentDefinition = TryCast(plateOcc.Definition, Inventor.PartComponentDefinition)
@@ -79,7 +81,19 @@ Sub Main()
         Exit Sub
     End If
 
-    Dim invertPlate As Inventor.Matrix = plateOcc.Transformation.Copy()
+    ' A face picked in this assembly belongs to a proxy whose transform is already
+    ' expressed here, including a part that sits inside a subassembly. If that
+    ' transform does not put the part face on the face that was clicked, the
+    ' occurrence only knows its position inside its parent, so multiply each
+    ' level from the part out to this assembly.
+    Dim plateToAssembly As Inventor.Matrix = MGHPartToAssembly(plateOcc, plateNativeFace, plateFaceProxy)
+    If plateToAssembly Is Nothing Then
+        System.Windows.Forms.MessageBox.Show( _
+            "The plate's position in this assembly could not be read, so no holes were created.", _
+            "Grouped Mounting Holes")
+        Exit Sub
+    End If
+    Dim invertPlate As Inventor.Matrix = plateToAssembly.Copy()
     invertPlate.Invert()
     Dim plateOutX As Double = plateAssemblyPlane.Normal.X
     Dim plateOutY As Double = plateAssemblyPlane.Normal.Y
@@ -375,7 +389,7 @@ Sub Main()
     If review.SkipHoleCreation OrElse cutsRequested = 0 Then
         Dim hardwareOnlySummary As String = ""
         Try
-            hardwareOnlySummary = MGHPlaceWashers(app, aDoc, desiredGroups, plateOcc, plateOutX, plateOutY, plateOutZ)
+            hardwareOnlySummary = MGHPlaceWashers(app, aDoc, desiredGroups, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ)
         Catch washerEx As System.Exception
             hardwareOnlySummary = "Hardware was not placed." & vbCrLf & washerEx.Message
         End Try
@@ -660,7 +674,7 @@ Sub Main()
         End If
         Dim washerSummary As String = ""
         Try
-            washerSummary = MGHPlaceWashers(app, aDoc, desiredGroups, plateOcc, plateOutX, plateOutY, plateOutZ)
+            washerSummary = MGHPlaceWashers(app, aDoc, desiredGroups, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ)
         Catch washerEx As System.Exception
             washerSummary = "Hardware was not placed." & vbCrLf & washerEx.Message
         End Try
@@ -3455,6 +3469,306 @@ Function MGHReadScrew(app As Inventor.Application, path As String) As MGHWasherM
     Return model
 End Function
 
+' Maps a point through an Inventor matrix. Cells are row-major from Matrix.GetMatrixData.
+' Translation lives in cells 12, 13, and 14. Apply the left matrix before the right one.
+Sub MGHTransformPoint(m() As Double, x As Double, y As Double, z As Double, _
+    ByRef outX As Double, ByRef outY As Double, ByRef outZ As Double)
+    outX = x * m(0) + y * m(4) + z * m(8) + m(12)
+    outY = x * m(1) + y * m(5) + z * m(9) + m(13)
+    outZ = x * m(2) + y * m(6) + z * m(10) + m(14)
+End Sub
+
+Function MGHMultiplyMatrices(left() As Double, right() As Double) As Double()
+    If left Is Nothing OrElse right Is Nothing Then Return Nothing
+    If left.Length <> 16 OrElse right.Length <> 16 Then Return Nothing
+    Dim product(15) As Double
+    Dim row As Integer
+    For row = 0 To 3
+        Dim col As Integer
+        For col = 0 To 3
+            Dim sum As Double = 0
+            Dim k As Integer
+            For k = 0 To 3
+                sum += left(row * 4 + k) * right(k * 4 + col)
+            Next
+            product(row * 4 + col) = sum
+        Next
+    Next
+    Return product
+End Function
+
+' locals(0) is the part inside its immediate parent. Each later matrix is the next parent.
+Function MGHComposeLeafChain(locals()() As Double) As Double()
+    If locals Is Nothing OrElse locals.Length = 0 Then Return Nothing
+    Dim total() As Double = CType(locals(0).Clone(), Double())
+    Dim i As Integer
+    For i = 1 To locals.Length - 1
+        total = MGHMultiplyMatrices(total, locals(i))
+        If total Is Nothing Then Return Nothing
+    Next
+    Return total
+End Function
+
+' True when every part-space point lands on its assembly-space point and the face normal stays parallel.
+Function MGHMatrixMapsPlacement(m() As Double, fromX() As Double, fromY() As Double, fromZ() As Double, _
+    toX() As Double, toY() As Double, toZ() As Double, _
+    partNx As Double, partNy As Double, partNz As Double, _
+    asmNx As Double, asmNy As Double, asmNz As Double) As Boolean
+    If m Is Nothing OrElse m.Length <> 16 Then Return False
+    If fromX Is Nothing OrElse toX Is Nothing OrElse fromY Is Nothing OrElse toY Is Nothing Then Return False
+    If fromZ Is Nothing OrElse toZ Is Nothing Then Return False
+    If fromX.Length < 2 OrElse fromX.Length <> toX.Length Then Return False
+    If fromY.Length <> fromX.Length OrElse fromZ.Length <> fromX.Length Then Return False
+    If toY.Length <> fromX.Length OrElse toZ.Length <> fromX.Length Then Return False
+    Dim i As Integer
+    For i = 0 To fromX.Length - 1
+        Dim x As Double, y As Double, z As Double
+        MGHTransformPoint(m, fromX(i), fromY(i), fromZ(i), x, y, z)
+        Dim dx As Double = x - toX(i)
+        Dim dy As Double = y - toY(i)
+        Dim dz As Double = z - toZ(i)
+        If dx * dx + dy * dy + dz * dz > 0.000025 Then Return False ' 0.005 cm
+    Next
+    Dim tipX As Double, tipY As Double, tipZ As Double
+    Dim baseX As Double, baseY As Double, baseZ As Double
+    MGHTransformPoint(m, fromX(0) + partNx, fromY(0) + partNy, fromZ(0) + partNz, tipX, tipY, tipZ)
+    MGHTransformPoint(m, fromX(0), fromY(0), fromZ(0), baseX, baseY, baseZ)
+    Dim vx As Double = tipX - baseX
+    Dim vy As Double = tipY - baseY
+    Dim vz As Double = tipZ - baseZ
+    Dim vLen As Double = System.Math.Sqrt(vx * vx + vy * vy + vz * vz)
+    Dim aLen As Double = System.Math.Sqrt(asmNx * asmNx + asmNy * asmNy + asmNz * asmNz)
+    If vLen < 0.000000001 OrElse aLen < 0.000000001 Then Return False
+    Dim dot As Double = (vx * asmNx + vy * asmNy + vz * asmNz) / (vLen * aLen)
+    Return System.Math.Abs(dot) > 0.999
+End Function
+
+' 0 keeps the occurrence transform. 1 uses the multiplied parent chain. -1 rejects both.
+' Fewer than two separated points is not evidence, so the occurrence transform is kept.
+Function MGHChoosePartToAssembly(direct() As Double, composed() As Double, _
+    fromX() As Double, fromY() As Double, fromZ() As Double, _
+    toX() As Double, toY() As Double, toZ() As Double, _
+    partNx As Double, partNy As Double, partNz As Double, _
+    asmNx As Double, asmNy As Double, asmNz As Double) As Integer
+    If fromX Is Nothing OrElse fromX.Length < 2 Then Return 0
+    If partNx * partNx + partNy * partNy + partNz * partNz < 0.000000001 Then Return 0
+    If asmNx * asmNx + asmNy * asmNy + asmNz * asmNz < 0.000000001 Then Return 0
+    Dim separated As Boolean = False
+    Dim i As Integer
+    For i = 1 To fromX.Length - 1
+        Dim dx As Double = fromX(i) - fromX(0)
+        Dim dy As Double = fromY(i) - fromY(0)
+        Dim dz As Double = fromZ(i) - fromZ(0)
+        If dx * dx + dy * dy + dz * dz > 0.0025 Then separated = True ' 0.05 cm
+    Next
+    If Not separated Then Return 0
+    If MGHMatrixMapsPlacement(direct, fromX, fromY, fromZ, toX, toY, toZ, partNx, partNy, partNz, asmNx, asmNy, asmNz) Then Return 0
+    If MGHMatrixMapsPlacement(composed, fromX, fromY, fromZ, toX, toY, toZ, partNx, partNy, partNz, asmNx, asmNy, asmNz) Then Return 1
+    Return -1
+End Function
+
+Function MGHMatrixCells(matrix As Inventor.Matrix) As Double()
+    Dim cells(15) As Double
+    matrix.GetMatrixData(cells)
+    Return cells
+End Function
+
+Function MGHParentOccurrence(occ As Inventor.ComponentOccurrence) As Inventor.ComponentOccurrence
+    If occ Is Nothing Then Return Nothing
+    Try
+        Return occ.ParentOccurrence
+    Catch
+        Return Nothing
+    End Try
+End Function
+
+' The transform that places this occurrence in its immediate parent, not in a higher assembly.
+Function MGHLocalOccurrenceTransform(occ As Inventor.ComponentOccurrence) As Inventor.Matrix
+    If occ Is Nothing Then Return Nothing
+    Dim proxy As Inventor.ComponentOccurrenceProxy = TryCast(occ, Inventor.ComponentOccurrenceProxy)
+    If proxy IsNot Nothing Then
+        Try
+            Dim native As Inventor.ComponentOccurrence = TryCast(proxy.NativeObject, Inventor.ComponentOccurrence)
+            If native IsNot Nothing Then Return native.Transformation.Copy()
+        Catch
+        End Try
+    End If
+    Return occ.Transformation.Copy()
+End Function
+
+Function MGHComposeToContext(occ As Inventor.ComponentOccurrence) As Inventor.Matrix
+    If occ Is Nothing Then Return Nothing
+    Dim total As Inventor.Matrix = MGHLocalOccurrenceTransform(occ)
+    If total Is Nothing Then Return Nothing
+    Dim cursor As Inventor.ComponentOccurrence = MGHParentOccurrence(occ)
+    Dim guard As Integer = 0
+    Do While cursor IsNot Nothing AndAlso guard < 32
+        Dim local As Inventor.Matrix = MGHLocalOccurrenceTransform(cursor)
+        If local Is Nothing Then Return Nothing
+        total.PostMultiplyBy(local)
+        cursor = MGHParentOccurrence(cursor)
+        guard += 1
+    Loop
+    Return total
+End Function
+
+Function MGHReadVertexSamples(nativeFace As Inventor.Face, faceProxy As Inventor.Face, _
+    ByRef fromX() As Double, ByRef fromY() As Double, ByRef fromZ() As Double, _
+    ByRef toX() As Double, ByRef toY() As Double, ByRef toZ() As Double) As Boolean
+    fromX = Nothing : fromY = Nothing : fromZ = Nothing
+    toX = Nothing : toY = Nothing : toZ = Nothing
+    Dim nCount As Integer = 0
+    Dim pCount As Integer = 0
+    Try
+        nCount = nativeFace.Vertices.Count
+        pCount = faceProxy.Vertices.Count
+    Catch
+        Return False
+    End Try
+    If nCount < 2 OrElse nCount <> pCount Then Return False
+    Dim take As Integer = nCount
+    If take > 4 Then take = 4
+    Dim fx As New System.Collections.Generic.List(Of Double)()
+    Dim fy As New System.Collections.Generic.List(Of Double)()
+    Dim fz As New System.Collections.Generic.List(Of Double)()
+    Dim tx As New System.Collections.Generic.List(Of Double)()
+    Dim ty As New System.Collections.Generic.List(Of Double)()
+    Dim tz As New System.Collections.Generic.List(Of Double)()
+    Dim i As Integer
+    For i = 1 To take
+        Try
+            Dim np As Inventor.Point = nativeFace.Vertices.Item(i).Point
+            Dim pp As Inventor.Point = faceProxy.Vertices.Item(i).Point
+            fx.Add(np.X) : fy.Add(np.Y) : fz.Add(np.Z)
+            tx.Add(pp.X) : ty.Add(pp.Y) : tz.Add(pp.Z)
+        Catch
+        End Try
+    Next
+    If fx.Count < 2 Then Return False
+    fromX = fx.ToArray() : fromY = fy.ToArray() : fromZ = fz.ToArray()
+    toX = tx.ToArray() : toY = ty.ToArray() : toZ = tz.ToArray()
+    Return True
+End Function
+
+Sub MGHAppendEdgeSamples(nativeEdge As Inventor.Edge, proxyEdge As Inventor.Edge, _
+    fx As System.Collections.Generic.List(Of Double), fy As System.Collections.Generic.List(Of Double), fz As System.Collections.Generic.List(Of Double), _
+    tx As System.Collections.Generic.List(Of Double), ty As System.Collections.Generic.List(Of Double), tz As System.Collections.Generic.List(Of Double))
+    If nativeEdge Is Nothing OrElse proxyEdge Is Nothing Then Exit Sub
+    If fx Is Nothing OrElse fx.Count >= 4 Then Exit Sub
+    Try
+        Dim nMin As Double, nMax As Double, pMin As Double, pMax As Double
+        nativeEdge.Evaluator.GetParamExtents(nMin, nMax)
+        proxyEdge.Evaluator.GetParamExtents(pMin, pMax)
+        If System.Math.Abs(nMin - pMin) > 0.000001 Then Exit Sub
+        If System.Math.Abs(nMax - pMax) > 0.000001 Then Exit Sub
+        If System.Math.Abs(nMax - nMin) < 0.000001 Then Exit Sub
+        Dim params(1) As Double
+        params(0) = nMin
+        params(1) = nMin + (nMax - nMin) * 0.37
+        Dim nPts(5) As Double
+        Dim pPts(5) As Double
+        nativeEdge.Evaluator.GetPointAtParam(params, nPts)
+        proxyEdge.Evaluator.GetPointAtParam(params, pPts)
+        Dim k As Integer
+        For k = 0 To 1
+            fx.Add(nPts(k * 3))
+            fy.Add(nPts(k * 3 + 1))
+            fz.Add(nPts(k * 3 + 2))
+            tx.Add(pPts(k * 3))
+            ty.Add(pPts(k * 3 + 1))
+            tz.Add(pPts(k * 3 + 2))
+        Next
+    Catch
+    End Try
+End Sub
+
+Function MGHReadEdgeSamples(nativeFace As Inventor.Face, faceProxy As Inventor.Face, _
+    ByRef fromX() As Double, ByRef fromY() As Double, ByRef fromZ() As Double, _
+    ByRef toX() As Double, ByRef toY() As Double, ByRef toZ() As Double) As Boolean
+    fromX = Nothing : fromY = Nothing : fromZ = Nothing
+    toX = Nothing : toY = Nothing : toZ = Nothing
+    Dim nCount As Integer = 0
+    Dim pCount As Integer = 0
+    Try
+        nCount = nativeFace.Edges.Count
+        pCount = faceProxy.Edges.Count
+    Catch
+        Return False
+    End Try
+    If nCount < 1 OrElse nCount <> pCount Then Return False
+    Dim fx As New System.Collections.Generic.List(Of Double)()
+    Dim fy As New System.Collections.Generic.List(Of Double)()
+    Dim fz As New System.Collections.Generic.List(Of Double)()
+    Dim tx As New System.Collections.Generic.List(Of Double)()
+    Dim ty As New System.Collections.Generic.List(Of Double)()
+    Dim tz As New System.Collections.Generic.List(Of Double)()
+    Dim i As Integer
+    For i = 1 To nCount
+        If fx.Count >= 4 Then Exit For
+        MGHAppendEdgeSamples(nativeFace.Edges.Item(i), faceProxy.Edges.Item(i), fx, fy, fz, tx, ty, tz)
+    Next
+    If fx.Count < 2 Then Return False
+    fromX = fx.ToArray() : fromY = fy.ToArray() : fromZ = fz.ToArray()
+    toX = tx.ToArray() : toY = ty.ToArray() : toZ = tz.ToArray()
+    Return True
+End Function
+
+' Nothing means the face points disagree with every candidate, so the rule must not cut.
+' A top-level part uses its own transform. A nested part uses the proxy transform when
+' that transform lands the part face on the clicked face, and the parent chain otherwise.
+Function MGHPartToAssembly(occ As Inventor.ComponentOccurrence, _
+    nativeFace As Inventor.Face, faceProxy As Inventor.Face) As Inventor.Matrix
+    If occ Is Nothing Then Return Nothing
+    Dim direct As Inventor.Matrix = occ.Transformation.Copy()
+    If Not TypeOf occ Is Inventor.ComponentOccurrenceProxy Then Return direct
+    Dim partNx As Double = 0
+    Dim partNy As Double = 0
+    Dim partNz As Double = 0
+    Dim asmNx As Double = 0
+    Dim asmNy As Double = 0
+    Dim asmNz As Double = 0
+    Try
+        Dim partPlane As Inventor.Plane = TryCast(nativeFace.Geometry, Inventor.Plane)
+        Dim asmPlane As Inventor.Plane = TryCast(faceProxy.Geometry, Inventor.Plane)
+        If partPlane Is Nothing OrElse asmPlane Is Nothing Then Return direct
+        partNx = partPlane.Normal.X : partNy = partPlane.Normal.Y : partNz = partPlane.Normal.Z
+        asmNx = asmPlane.Normal.X : asmNy = asmPlane.Normal.Y : asmNz = asmPlane.Normal.Z
+    Catch
+        Return direct
+    End Try
+    Dim composed As Inventor.Matrix = Nothing
+    Dim directCells() As Double = Nothing
+    Dim composedCells() As Double = Nothing
+    Try
+        composed = MGHComposeToContext(occ)
+        directCells = MGHMatrixCells(direct)
+        If composed IsNot Nothing Then composedCells = MGHMatrixCells(composed)
+    Catch
+        Return direct
+    End Try
+    Dim tried As Boolean = False
+    Dim fromX() As Double = Nothing
+    Dim fromY() As Double = Nothing
+    Dim fromZ() As Double = Nothing
+    Dim toX() As Double = Nothing
+    Dim toY() As Double = Nothing
+    Dim toZ() As Double = Nothing
+    If MGHReadVertexSamples(nativeFace, faceProxy, fromX, fromY, fromZ, toX, toY, toZ) Then
+        tried = True
+        Dim vertexChoice As Integer = MGHChoosePartToAssembly(directCells, composedCells, fromX, fromY, fromZ, toX, toY, toZ, partNx, partNy, partNz, asmNx, asmNy, asmNz)
+        If vertexChoice = 0 Then Return direct
+        If vertexChoice = 1 AndAlso composed IsNot Nothing Then Return composed.Copy()
+    End If
+    If MGHReadEdgeSamples(nativeFace, faceProxy, fromX, fromY, fromZ, toX, toY, toZ) Then
+        tried = True
+        Dim edgeChoice As Integer = MGHChoosePartToAssembly(directCells, composedCells, fromX, fromY, fromZ, toX, toY, toZ, partNx, partNy, partNz, asmNx, asmNy, asmNz)
+        If edgeChoice = 0 Then Return direct
+        If edgeChoice = 1 AndAlso composed IsNot Nothing Then Return composed.Copy()
+    End If
+    If Not tried Then Return direct
+    Return Nothing
+End Function
+
 ' Native circular edge of the plate hole nearest this plate-space center.
 Function MGHPlateRimEdge(plateOcc As Inventor.ComponentOccurrence, center As Inventor.Point) As Inventor.Edge
     If plateOcc Is Nothing OrElse center Is Nothing Then Return Nothing
@@ -3482,6 +3796,7 @@ End Function
 
 ' The plate-face side. contact is on the face the user selected, in assembly space.
 Function MGHPlateHardwareSeat(app As Inventor.Application, plateOcc As Inventor.ComponentOccurrence, _
+    plateToAssembly As Inventor.Matrix, _
     outX As Double, outY As Double, outZ As Double, center As Inventor.Point, _
     ByRef contact As Inventor.Point, ByRef outward As Inventor.UnitVector, ByRef holeEdge As Inventor.Edge) As Boolean
     contact = Nothing
@@ -3490,8 +3805,10 @@ Function MGHPlateHardwareSeat(app As Inventor.Application, plateOcc As Inventor.
     If plateOcc Is Nothing OrElse center Is Nothing Then Return False
     Dim length As Double = System.Math.Sqrt(outX * outX + outY * outY + outZ * outZ)
     If length < 0.000000001 Then Return False
+    Dim plateMatrix As Inventor.Matrix = plateToAssembly
+    If plateMatrix Is Nothing Then plateMatrix = plateOcc.Transformation
     contact = center.Copy()
-    contact.TransformBy(plateOcc.Transformation)
+    contact.TransformBy(plateMatrix)
     outward = app.TransientGeometry.CreateUnitVector(outX / length, outY / length, outZ / length)
     Try
         holeEdge = MGHPlateRimEdge(plateOcc, center)
@@ -3503,10 +3820,12 @@ End Function
 
 ' Distance from one clicked rim to the plate face, in centimeters. -1 when the rim was not recorded.
 Function MGHHoleGripCm(app As Inventor.Application, plateOcc As Inventor.ComponentOccurrence, _
-    center As Inventor.Point, rim As MGHComponentRim) As Double
+    plateToAssembly As Inventor.Matrix, center As Inventor.Point, rim As MGHComponentRim) As Double
     If app Is Nothing OrElse plateOcc Is Nothing OrElse center Is Nothing OrElse rim Is Nothing Then Return -1
+    Dim plateMatrix As Inventor.Matrix = plateToAssembly
+    If plateMatrix Is Nothing Then plateMatrix = plateOcc.Transformation
     Dim platePoint As Inventor.Point = center.Copy()
-    platePoint.TransformBy(plateOcc.Transformation)
+    platePoint.TransformBy(plateMatrix)
     Dim rimPoint As Inventor.Point = app.TransientGeometry.CreatePoint(rim.CenterX, rim.CenterY, rim.CenterZ)
     Return platePoint.DistanceTo(rimPoint)
 End Function
@@ -3568,7 +3887,8 @@ End Function
 
 Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
     groups As System.Collections.Generic.SortedDictionary(Of String, OutputGroup), _
-    plateOcc As Inventor.ComponentOccurrence, plateOutX As Double, plateOutY As Double, plateOutZ As Double) As String
+    plateOcc As Inventor.ComponentOccurrence, plateToAssembly As Inventor.Matrix, _
+    plateOutX As Double, plateOutY As Double, plateOutZ As Double) As String
     Dim notes As New System.Collections.Generic.List(Of String)()
     Dim hardwareProgress As Inventor.ProgressBar = Nothing
     ' iLogic already has a transaction open on the assembly. Starting a second one
@@ -3694,7 +4014,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             For centerIndex = 0 To g.Centers.Count - 1
                 Dim rim As MGHComponentRim = Nothing
                 If g.Rims IsNot Nothing AndAlso centerIndex < g.Rims.Count Then rim = g.Rims(centerIndex)
-                Dim gripCm As Double = MGHHoleGripCm(app, plateOcc, g.Centers(centerIndex), rim)
+                Dim gripCm As Double = MGHHoleGripCm(app, plateOcc, plateToAssembly, g.Centers(centerIndex), rim)
                 If gripCm < 0 Then
                     gripCm = 0
                     missingRim = True
@@ -3799,7 +4119,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             If placeScrew Then
                 Dim countedRim As MGHComponentRim = Nothing
                 If counted.Rims IsNot Nothing AndAlso countedIndex < counted.Rims.Count Then countedRim = counted.Rims(countedIndex)
-                Dim countedGrip As Double = MGHHoleGripCm(app, plateOcc, counted.Centers(countedIndex), countedRim)
+                Dim countedGrip As Double = MGHHoleGripCm(app, plateOcc, plateToAssembly, counted.Centers(countedIndex), countedRim)
                 Dim countedKey As String = MGHScrewLengthKey(countedSize, MGHScrewRequiredInches(countedGrip, countedScrewWasher, countedNutWasher, countedNutIn))
                 If screwModels.ContainsKey(countedKey) Then placeSteps += 1
             End If
@@ -3872,7 +4192,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         seated = MGHComponentWasherSeat(app, rim, True, contact, outwardAsm, holeEdge)
                     Else
                         host = plateOcc
-                        seated = MGHPlateHardwareSeat(app, plateOcc, plateOutX, plateOutY, plateOutZ, center, contact, outwardAsm, holeEdge)
+                        seated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, contact, outwardAsm, holeEdge)
                     End If
                     If Not seated Then
                         notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
@@ -3911,7 +4231,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         End If
                     Else
                         nutHost = plateOcc
-                        nutSeated = MGHPlateHardwareSeat(app, plateOcc, plateOutX, plateOutY, plateOutZ, center, nutContact, nutOutward, nutEdge)
+                        nutSeated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, nutContact, nutOutward, nutEdge)
                     End If
                     If Not nutSeated Then
                         If rim IsNot Nothing OrElse nutOnRim Then
@@ -3929,7 +4249,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                             "Nut", sizeName, center, nutEnd, "Nut", chosenNuts(sizeName), "nut", Not stackOnWasher, notes, replaced)
                     End If
                 End If
-                Dim screwKey As String = MGHScrewLengthKey(sizeName, MGHScrewRequiredInches(MGHHoleGripCm(app, plateOcc, center, rim), groupScrewWasher, groupNutWasher, groupNutIn))
+                Dim screwKey As String = MGHScrewLengthKey(sizeName, MGHScrewRequiredInches(MGHHoleGripCm(app, plateOcc, plateToAssembly, center, rim), groupScrewWasher, groupNutWasher, groupNutIn))
                 Dim screwModel As MGHWasherModel = Nothing
                 If screwModels.ContainsKey(screwKey) Then screwModel = screwModels(screwKey)
                 If placeScrew AndAlso screwModel IsNot Nothing Then
@@ -3951,7 +4271,7 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                         End If
                     Else
                         screwHost = plateOcc
-                        screwSeated = MGHPlateHardwareSeat(app, plateOcc, plateOutX, plateOutY, plateOutZ, center, screwContact, screwOutward, screwEdge)
+                        screwSeated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, screwContact, screwOutward, screwEdge)
                     End If
                     If screwSeated Then
                         Dim stackOnWasher As Boolean = screwWasherPlaced AndAlso screwWasherThickness > 0.000000001
