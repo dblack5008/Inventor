@@ -341,8 +341,8 @@ Sub Main()
     Dim trans As Inventor.Transaction = Nothing
     Dim progress As Inventor.ProgressBar = Nothing
     Dim operationInfo As String = "Starting plate transaction"
-    ' DeferUpdates is document state. A transaction abort does not reliably clear
-    ' it, so the catch path turns it back off.
+    ' Component definitions have no DeferUpdates member. The flag only records
+    ' whether a later failure should clear a deferral, and clearing is a no-op.
     Dim updatesDeferred As Boolean = False
     Try
         ' Every tick represents a REAL completed unit of work; no estimated clock times.
@@ -473,10 +473,10 @@ Sub Main()
             MGHProgressTick(progress, app, "Prepared group " & preparationIndex.ToString() & "/" & desiredGroups.Count.ToString() & ": " & g.Label)
         Next
 
-        ' Direction probes above used the solid as it exists now. Defer the part
-        ' solve so every new sketch point and Hole feature is created before the
-        ' plate rebuilds. Material removal is checked after that single rebuild.
-        operationInfo = "Deferring the plate rebuild until every group is created"
+        ' Direction probes above used the solid as it exists now. Hole centers are
+        ' solved once per sketch. The part itself rebuilds at the Update2 below,
+        ' after every group exists. Material removal is checked on that rebuild.
+        operationInfo = "Creating every hole group before the plate rebuild"
         MGHProgressMessage(progress, app, operationInfo)
         plateTarget.SetDeferUpdates(True)
         updatesDeferred = True
@@ -1105,11 +1105,13 @@ Public Class MGHEditTarget
     End Function
 
     Public Sub SetDeferUpdates(defer As Boolean)
-        If partDef IsNot Nothing Then
-            partDef.DeferUpdates = defer
-        Else
-            asmDef.DeferUpdates = defer
-        End If
+        ' Inventor 2027 does not have DeferUpdates on PartComponentDefinition,
+        ' SheetMetalComponentDefinition, or AssemblyComponentDefinition. iLogic
+        ' late-binds that assignment. On a sheet metal plate it throws
+        ' MissingMemberException and the hole transaction rolls back before any
+        ' feature is created. A standard part fails the same way. Sketch solves
+        ' are already deferred in MGHAddHoleCenters. The plate rebuild is the
+        ' Update2 after the groups exist.
     End Sub
 End Class
 
