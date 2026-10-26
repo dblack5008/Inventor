@@ -1,0 +1,592 @@
+' SELECT MOUNTING FACE (Inventor 2027, external iLogic rule)
+' Opens every .ipt under a folder, including sub-folders, and asks for the face
+' that sits against the washer or the part. The face is saved in the part's
+' custom iProperties "MGH Mounting Face" and "MGH Mounting Face Context".
+' Grouped Mounting Hardware reads those properties and does not ask again.
+' Parts already carrying a face that still matches the model are skipped unless
+' that option is turned off. Each finished part is saved and closed.
+' Inventor backup folders named OldVersions are not opened.
+'
+Sub Main()
+    Dim app As Inventor.Application = ThisApplication
+    Dim home As Inventor.Document = Nothing
+    Try
+        home = app.ActiveDocument
+    Catch
+        home = Nothing
+    End Try
+
+    Dim start As New SMFStartDialog(SMFDefaultHardwareFolder())
+    If start.ShowDialog() <> System.Windows.Forms.DialogResult.OK Then
+        start.Dispose()
+        Exit Sub
+    End If
+    Dim folder As String = start.FolderPath
+    Dim skipExisting As Boolean = start.SkipExisting
+    start.Dispose()
+    If folder = "" OrElse Not System.IO.Directory.Exists(folder) Then
+        System.Windows.Forms.MessageBox.Show("That folder was not found.", "Select Mounting Face")
+        Exit Sub
+    End If
+
+    Dim files As New System.Collections.Generic.List(Of String)()
+    SMFCollectPartFiles(folder, files)
+    files.Sort(System.StringComparer.OrdinalIgnoreCase)
+    If files.Count = 0 Then
+        System.Windows.Forms.MessageBox.Show("No Inventor part files were found in " & folder & ".", "Select Mounting Face")
+        Exit Sub
+    End If
+
+    System.Windows.Forms.MessageBox.Show( _
+        "Each part opens in turn." & vbCrLf & vbCrLf & _
+        "Click the flat face that sits against the washer or the part." & vbCrLf & _
+        "On a nut, click the smooth metal face, not the nylon ring." & vbCrLf & _
+        "On a screw, click the underside of the head." & vbCrLf & vbCrLf & _
+        "Skip This Part leaves that file unchanged." & vbCrLf & _
+        "Stop ends the batch. Parts already saved stay saved.", _
+        "Select Mounting Face")
+
+    Dim saved As Integer = 0
+    Dim skipped As Integer = 0
+    Dim failed As New System.Collections.Generic.List(Of String)()
+    Dim stopped As Boolean = False
+    Dim progress As Inventor.ProgressBar = Nothing
+    Try
+        progress = app.CreateProgressBar(False, files.Count, "Select Mounting Face")
+    Catch
+        progress = Nothing
+    End Try
+
+    Dim index As Integer
+    For index = 0 To files.Count - 1
+        Dim path As String = files(index)
+        Dim display As String = SMFRelativePath(folder, path)
+        Dim position As String = (index + 1).ToString() & " of " & files.Count.ToString()
+        SMFProgressTick(progress, app, "Opening " & position & " — " & display)
+        Dim openedHere As Boolean = SMFFindOpenDocument(app, path) Is Nothing
+        Dim part As Inventor.PartDocument = Nothing
+        Try
+            Dim opened As Inventor.Document = app.Documents.Open(path, False)
+            part = TryCast(opened, Inventor.PartDocument)
+            If part Is Nothing Then
+                failed.Add(display & " is not a part.")
+                If openedHere AndAlso opened IsNot Nothing Then SMFCloseDocument(opened)
+                Continue For
+            End If
+            Dim bound As Boolean = False
+            Try
+                bound = SMFLoadMountingFace(part) IsNot Nothing
+            Catch
+                bound = False
+            End Try
+            If Not SMFShouldPrompt(bound, skipExisting) Then
+                skipped += 1
+                If openedHere Then SMFCloseDocument(part)
+                Continue For
+            End If
+            If Not part.IsModifiable Then
+                failed.Add(display & " is read-only, so its mounting face was not changed.")
+                If openedHere Then SMFCloseDocument(part)
+                Continue For
+            End If
+            app.Documents.Open(path, True)
+            Try
+                part.Activate()
+            Catch
+            End Try
+            Try
+                If app.ActiveView IsNot Nothing Then app.ActiveView.Fit(True)
+            Catch
+            End Try
+            SMFProgressMessage(progress, app, "Click the mounting face — " & position & " — " & display)
+            Dim selector As New SMFFaceSelector()
+            Dim outcome As Integer = selector.Run(app, part, display, position)
+            If outcome = SMFPickResult.StopRun Then
+                stopped = True
+                If openedHere Then SMFCloseDocument(part)
+                Exit For
+            End If
+            If outcome = SMFPickResult.SkipPart OrElse selector.Face Is Nothing Then
+                skipped += 1
+                If openedHere Then SMFCloseDocument(part)
+                Continue For
+            End If
+            SMFSaveMountingFace(part, selector.Face)
+            part.Save()
+            saved += 1
+            If openedHere Then SMFCloseDocument(part)
+        Catch ex As System.Exception
+            failed.Add(display & " — " & ex.Message)
+            If openedHere AndAlso part IsNot Nothing Then SMFCloseDocument(part)
+        End Try
+    Next
+
+    If progress IsNot Nothing Then
+        Try
+            progress.Close()
+        Catch
+        End Try
+    End If
+    If home IsNot Nothing Then
+        Try
+            home.Activate()
+        Catch
+        End Try
+    End If
+
+    Dim summary As New System.Text.StringBuilder()
+    summary.Append("Mounting faces saved: " & saved.ToString())
+    summary.Append(vbCrLf & "Parts skipped: " & skipped.ToString())
+    If stopped Then summary.Append(vbCrLf & "Stopped before the remaining parts.")
+    If failed.Count > 0 Then
+        summary.Append(vbCrLf & "Not saved:")
+        Dim note As String
+        For Each note In failed
+            summary.Append(vbCrLf & "- " & note)
+        Next
+    End If
+    System.Windows.Forms.MessageBox.Show(summary.ToString(), "Select Mounting Face")
+End Sub
+
+' 1 = face chosen, 2 = skip this part, 3 = stop the batch.
+Public Class SMFPickResult
+    Public Const FaceChosen As Integer = 1
+    Public Const SkipPart As Integer = 2
+    Public Const StopRun As Integer = 3
+End Class
+
+Public Class SMFStartDialog
+    Inherits System.Windows.Forms.Form
+    Private folderBox As System.Windows.Forms.TextBox
+    Private skipBox As System.Windows.Forms.CheckBox
+    Public FolderPath As String
+    Public SkipExisting As Boolean
+
+    Public Sub New(initialFolder As String)
+        MyBase.New()
+        Me.Text = "Select Mounting Face"
+        Me.Width = 560 : Me.Height = 280
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedDialog
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.MaximizeBox = False : Me.MinimizeBox = False
+        Dim note As New System.Windows.Forms.Label()
+        note.Left = 14 : note.Top = 12 : note.Width = 516 : note.Height = 48
+        note.Text = "Choose the hardware folder. Every Inventor part in that folder and its sub-folders will open so you can click its mounting face."
+        Me.Controls.Add(note)
+        Dim folderLabel As New System.Windows.Forms.Label()
+        folderLabel.Left = 14 : folderLabel.Top = 68 : folderLabel.Width = 70 : folderLabel.Height = 22
+        folderLabel.Text = "Folder"
+        Me.Controls.Add(folderLabel)
+        folderBox = New System.Windows.Forms.TextBox()
+        folderBox.Left = 90 : folderBox.Top = 66 : folderBox.Width = 430 : folderBox.Height = 22
+        folderBox.Text = initialFolder
+        Me.Controls.Add(folderBox)
+        Dim browseBtn As New System.Windows.Forms.Button()
+        browseBtn.Text = "Browse"
+        browseBtn.Left = 14 : browseBtn.Top = 98 : browseBtn.Width = 120 : browseBtn.Height = 28
+        AddHandler browseBtn.Click, AddressOf BrowseFolder
+        Me.Controls.Add(browseBtn)
+        skipBox = New System.Windows.Forms.CheckBox()
+        skipBox.Text = "Skip parts that already have a mounting face"
+        skipBox.Checked = True
+        skipBox.Left = 14 : skipBox.Top = 140 : skipBox.Width = 500 : skipBox.Height = 24
+        Me.Controls.Add(skipBox)
+        Dim skipNote As New System.Windows.Forms.Label()
+        skipNote.Left = 32 : skipNote.Top = 164 : skipNote.Width = 490 : skipNote.Height = 32
+        skipNote.Text = "Turn this off to choose the face again on every part. The new face replaces the saved one."
+        Me.Controls.Add(skipNote)
+        Dim startBtn As New System.Windows.Forms.Button()
+        startBtn.Text = "Start"
+        startBtn.Left = 14 : startBtn.Top = 204 : startBtn.Width = 140 : startBtn.Height = 32
+        AddHandler startBtn.Click, AddressOf StartClick
+        Me.Controls.Add(startBtn)
+        Dim cancelBtn As New System.Windows.Forms.Button()
+        cancelBtn.Text = "Cancel"
+        cancelBtn.Left = 390 : cancelBtn.Top = 204 : cancelBtn.Width = 140 : cancelBtn.Height = 32
+        AddHandler cancelBtn.Click, AddressOf CancelClick
+        Me.Controls.Add(cancelBtn)
+    End Sub
+
+    Private Sub BrowseFolder(sender As Object, e As System.EventArgs)
+        Dim browser As New System.Windows.Forms.FolderBrowserDialog()
+        browser.Description = "Select the hardware folder. Every part in its sub-folders will be opened."
+        browser.ShowNewFolderButton = False
+        If System.IO.Directory.Exists(folderBox.Text) Then browser.SelectedPath = folderBox.Text
+        If browser.ShowDialog() = System.Windows.Forms.DialogResult.OK AndAlso browser.SelectedPath <> "" Then
+            folderBox.Text = browser.SelectedPath
+        End If
+        browser.Dispose()
+    End Sub
+
+    Private Sub StartClick(sender As Object, e As System.EventArgs)
+        Dim chosen As String = folderBox.Text.Trim()
+        If chosen = "" OrElse Not System.IO.Directory.Exists(chosen) Then
+            System.Windows.Forms.MessageBox.Show("Choose a folder that exists.", "Select Mounting Face")
+            Exit Sub
+        End If
+        FolderPath = chosen
+        SkipExisting = skipBox.Checked
+        Me.DialogResult = System.Windows.Forms.DialogResult.OK
+        Me.Close()
+    End Sub
+
+    Private Sub CancelClick(sender As Object, e As System.EventArgs)
+        Me.DialogResult = System.Windows.Forms.DialogResult.Cancel
+        Me.Close()
+    End Sub
+End Class
+
+Public Class SMFFacePalette
+    Inherits System.Windows.Forms.Form
+    Public Event SkipPressed As System.EventHandler
+    Public Event StopPressed As System.EventHandler
+
+    Public Sub New(fileName As String, position As String)
+        MyBase.New()
+        Me.Text = "Mounting face — " & position
+        Me.Width = 520 : Me.Height = 230
+        Me.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen
+        Me.FormBorderStyle = System.Windows.Forms.FormBorderStyle.FixedToolWindow
+        Me.TopMost = True
+        Me.ShowInTaskbar = False
+        Me.MaximizeBox = False : Me.MinimizeBox = False
+        Dim directions As New System.Windows.Forms.Label()
+        directions.Left = 14 : directions.Top = 14 : directions.Width = 480 : directions.Height = 96
+        directions.Text = position & vbCrLf & fileName & vbCrLf & vbCrLf & _
+            "Click the flat face that sits against the washer or the part." & vbCrLf & _
+            "Nut: smooth metal face, not the nylon. Screw: underside of the head."
+        Me.Controls.Add(directions)
+        Dim skipBtn As New System.Windows.Forms.Button()
+        skipBtn.Text = "Skip This Part"
+        skipBtn.Left = 14 : skipBtn.Top = 140 : skipBtn.Width = 160 : skipBtn.Height = 32
+        AddHandler skipBtn.Click, AddressOf SkipClick
+        Me.Controls.Add(skipBtn)
+        Dim stopBtn As New System.Windows.Forms.Button()
+        stopBtn.Text = "Stop"
+        stopBtn.Left = 330 : stopBtn.Top = 140 : stopBtn.Width = 160 : stopBtn.Height = 32
+        AddHandler stopBtn.Click, AddressOf StopClick
+        Me.Controls.Add(stopBtn)
+    End Sub
+
+    Private Sub SkipClick(sender As Object, e As System.EventArgs)
+        RaiseEvent SkipPressed(Me, System.EventArgs.Empty)
+    End Sub
+
+    Private Sub StopClick(sender As Object, e As System.EventArgs)
+        RaiseEvent StopPressed(Me, System.EventArgs.Empty)
+    End Sub
+End Class
+
+Public Class SMFFaceSelector
+    Private WithEvents oInteraction As Inventor.InteractionEvents
+    Private WithEvents oSelect As Inventor.SelectEvents
+    Private palette As SMFFacePalette
+    Private completed As Boolean
+    Private outcome As Integer
+    Private target As Inventor.PartDocument
+    Public Face As Inventor.Face
+
+    Public Function Run(app As Inventor.Application, part As Inventor.PartDocument, fileName As String, position As String) As Integer
+        Face = Nothing
+        target = part
+        completed = False
+        outcome = SMFPickResult.SkipPart
+        Try
+            palette = New SMFFacePalette(fileName, position)
+            AddHandler palette.SkipPressed, AddressOf UserSkipped
+            AddHandler palette.StopPressed, AddressOf UserStopped
+            AddHandler palette.FormClosed, AddressOf PaletteClosed
+            oInteraction = app.CommandManager.CreateInteractionEvents()
+            oInteraction.InteractionDisabled = False
+            oInteraction.StatusBarText = "Click the mounting face of " & fileName
+            oSelect = oInteraction.SelectEvents
+            oSelect.AddSelectionFilter(Inventor.SelectionFilterEnum.kPartFacePlanarFilter)
+            oSelect.SingleSelectEnabled = True
+            palette.Show()
+            oInteraction.Start()
+            Do While Not completed
+                app.UserInterfaceManager.DoEvents()
+                System.Threading.Thread.Sleep(12)
+            Loop
+            Return outcome
+        Catch ex As System.Exception
+            System.Windows.Forms.MessageBox.Show("The face could not be selected:" & vbCrLf & ex.Message, "Select Mounting Face")
+            Return SMFPickResult.SkipPart
+        Finally
+            completed = True
+            If oInteraction IsNot Nothing Then
+                Try
+                    oInteraction.Stop()
+                Catch
+                End Try
+            End If
+            oSelect = Nothing
+            oInteraction = Nothing
+            If palette IsNot Nothing Then
+                Try
+                    palette.Close()
+                    palette.Dispose()
+                Catch
+                End Try
+                palette = Nothing
+            End If
+        End Try
+    End Function
+
+    Private Sub SelectedGeometry(JustSelectedEntities As Inventor.ObjectsEnumerator, _
+        SelectionDevice As Inventor.SelectionDeviceEnum, _
+        ModelPosition As Inventor.Point, ViewPosition As Inventor.Point2d, _
+        View As Inventor.View) Handles oSelect.OnSelect
+        If completed OrElse JustSelectedEntities Is Nothing Then Exit Sub
+        Dim chosen As Inventor.Face = Nothing
+        For Each ent As Object In JustSelectedEntities
+            chosen = FaceOnThisPart(ent)
+            If chosen IsNot Nothing Then Exit For
+        Next
+        If chosen Is Nothing Then
+            System.Windows.Forms.MessageBox.Show("Click a flat face on " & target.DisplayName & ".", "Select Mounting Face")
+            Exit Sub
+        End If
+        Dim plane As Inventor.Plane = Nothing
+        Try
+            plane = TryCast(chosen.Geometry, Inventor.Plane)
+        Catch
+            plane = Nothing
+        End Try
+        If plane Is Nothing Then
+            System.Windows.Forms.MessageBox.Show("Click a flat face. Edges and curved faces are not the mounting face.", "Select Mounting Face")
+            Exit Sub
+        End If
+        Face = chosen
+        outcome = SMFPickResult.FaceChosen
+        completed = True
+    End Sub
+
+    Private Sub InteractionTerminated() Handles oInteraction.OnTerminate
+        ' Esc or another Inventor command ends this part only. Stop is the button that ends the batch.
+        If Not completed Then
+            outcome = SMFPickResult.SkipPart
+            completed = True
+        End If
+    End Sub
+
+    Private Sub UserSkipped(sender As Object, e As System.EventArgs)
+        outcome = SMFPickResult.SkipPart
+        completed = True
+    End Sub
+
+    Private Sub UserStopped(sender As Object, e As System.EventArgs)
+        outcome = SMFPickResult.StopRun
+        completed = True
+    End Sub
+
+    Private Sub PaletteClosed(sender As Object, e As System.Windows.Forms.FormClosedEventArgs)
+        If Not completed Then
+            outcome = SMFPickResult.StopRun
+            completed = True
+        End If
+    End Sub
+
+    Private Function FaceOnThisPart(ent As Object) As Inventor.Face
+        If ent Is Nothing OrElse target Is Nothing Then Return Nothing
+        Dim face As Inventor.Face = TryCast(ent, Inventor.Face)
+        If face Is Nothing Then
+            Dim proxy As Inventor.FaceProxy = TryCast(ent, Inventor.FaceProxy)
+            If proxy IsNot Nothing Then face = proxy.NativeObject
+        End If
+        If face Is Nothing Then Return Nothing
+        Try
+            Dim ownerDef As Inventor.ComponentDefinition = TryCast(face.SurfaceBody.Parent, Inventor.ComponentDefinition)
+            If ownerDef Is Nothing OrElse ownerDef.Document Is Nothing Then Return Nothing
+            If Not String.Equals(ownerDef.Document.FullFileName, target.FullFileName, System.StringComparison.OrdinalIgnoreCase) Then Return Nothing
+        Catch
+            Return Nothing
+        End Try
+        Return face
+    End Function
+End Class
+
+Function SMFDefaultHardwareFolder() As String
+    Return "C:\Users\dblack\Desktop\ODINN\Design Activity\Hardware"
+End Function
+
+' True when both saved iProperty values are present. Binding is checked separately.
+Function SMFHasMountingFaceKeys(faceKey As String, contextKey As String) As Boolean
+    If faceKey Is Nothing OrElse contextKey Is Nothing Then Return False
+    Return faceKey.Trim() <> "" AndAlso contextKey.Trim() <> ""
+End Function
+
+' A saved face is left alone only when the skip option is on and the face still matches the part.
+Function SMFShouldPrompt(hasBoundFace As Boolean, skipExisting As Boolean) As Boolean
+    If skipExisting AndAlso hasBoundFace Then Return False
+    Return True
+End Function
+
+' OldVersions holds Inventor backups. A leading tilde is a temporary file.
+Function SMFIncludePartFile(path As String) As Boolean
+    If path Is Nothing Then Return False
+    Dim trimmed As String = path.Trim()
+    If trimmed = "" Then Return False
+    Dim separator As Char() = {"\"c, "/"c}
+    Dim segments() As String = trimmed.Split(separator, System.StringSplitOptions.RemoveEmptyEntries)
+    If segments.Length = 0 Then Return False
+    Dim name As String = segments(segments.Length - 1)
+    If name = "" OrElse name.StartsWith("~") Then Return False
+    If Not name.EndsWith(".ipt", System.StringComparison.OrdinalIgnoreCase) Then Return False
+    Dim segment As String
+    For Each segment In segments
+        If String.Equals(segment, "OldVersions", System.StringComparison.OrdinalIgnoreCase) Then Return False
+    Next
+    Return True
+End Function
+
+Function SMFRelativePath(root As String, fullPath As String) As String
+    If fullPath Is Nothing Then Return ""
+    If root Is Nothing OrElse root = "" Then Return fullPath
+    Dim prefix As String = root.TrimEnd("\"c, "/"c)
+    If fullPath.StartsWith(prefix, System.StringComparison.OrdinalIgnoreCase) AndAlso fullPath.Length > prefix.Length Then
+        Dim rest As String = fullPath.Substring(prefix.Length)
+        Return rest.TrimStart("\"c, "/"c)
+    End If
+    Return System.IO.Path.GetFileName(fullPath)
+End Function
+
+Sub SMFCollectPartFiles(folder As String, results As System.Collections.Generic.List(Of String))
+    If folder Is Nothing OrElse results Is Nothing OrElse Not System.IO.Directory.Exists(folder) Then Exit Sub
+    Try
+        Dim file As String
+        For Each file In System.IO.Directory.GetFiles(folder, "*.ipt")
+            If SMFIncludePartFile(file) Then results.Add(file)
+        Next
+    Catch
+    End Try
+    Try
+        Dim subfolder As String
+        For Each subfolder In System.IO.Directory.GetDirectories(folder)
+            If String.Equals(System.IO.Path.GetFileName(subfolder), "OldVersions", System.StringComparison.OrdinalIgnoreCase) Then Continue For
+            SMFCollectPartFiles(subfolder, results)
+        Next
+    Catch
+    End Try
+End Sub
+
+Function SMFFindOpenDocument(app As Inventor.Application, path As String) As Inventor.Document
+    If app Is Nothing OrElse path Is Nothing OrElse path = "" Then Return Nothing
+    Dim full As String = ""
+    Try
+        full = System.IO.Path.GetFullPath(path)
+    Catch
+        full = path
+    End Try
+    For Each doc As Inventor.Document In app.Documents
+        Try
+            If String.Equals(doc.FullFileName, full, System.StringComparison.OrdinalIgnoreCase) Then Return doc
+        Catch
+        End Try
+    Next
+    Return Nothing
+End Function
+
+Function SMFCustomProperties(doc As Inventor.Document) As Inventor.PropertySet
+    Return doc.PropertySets.Item("{D5CDD505-2E9C-101B-9397-08002B2CF9AE}")
+End Function
+
+Function SMFReadCustomProperty(doc As Inventor.Document, propName As String) As String
+    Try
+        Dim prop As Inventor.Property = SMFCustomProperties(doc).Item(propName)
+        If prop Is Nothing OrElse prop.Value Is Nothing Then Return ""
+        Return System.Convert.ToString(prop.Value)
+    Catch
+        Return ""
+    End Try
+End Function
+
+Sub SMFWriteCustomProperty(doc As Inventor.Document, propName As String, propValue As String)
+    Dim props As Inventor.PropertySet = SMFCustomProperties(doc)
+    Dim existing As Inventor.Property = Nothing
+    Try
+        existing = props.Item(propName)
+    Catch
+        existing = Nothing
+    End Try
+    If existing Is Nothing Then
+        props.Add(propValue, propName, System.Reflection.Missing.Value)
+    Else
+        existing.Value = propValue
+    End If
+End Sub
+
+Function SMFLoadMountingFace(part As Inventor.PartDocument) As Inventor.Face
+    Dim keyText As String = SMFReadCustomProperty(part, "MGH Mounting Face")
+    Dim contextText As String = SMFReadCustomProperty(part, "MGH Mounting Face Context")
+    If Not SMFHasMountingFaceKeys(keyText, contextText) Then Return Nothing
+    Dim ctxData() As Byte = System.Convert.FromBase64String(contextText)
+    Dim ctx As Integer = part.ReferenceKeyManager.LoadContextFromArray(ctxData)
+    Try
+        Dim key() As Byte = New Byte() {}
+        part.ReferenceKeyManager.StringToKey(keyText, key)
+        Dim matchType As Object = Nothing
+        Dim bound As Object = part.ReferenceKeyManager.BindKeyToObject(key, ctx, matchType)
+        Dim face As Inventor.Face = TryCast(bound, Inventor.Face)
+        If face Is Nothing Then
+            Dim many As Inventor.ObjectCollection = TryCast(bound, Inventor.ObjectCollection)
+            If many IsNot Nothing AndAlso many.Count > 0 Then face = TryCast(many.Item(1), Inventor.Face)
+        End If
+        Return face
+    Finally
+        Try
+            part.ReferenceKeyManager.ReleaseKeyContext(ctx)
+        Catch
+        End Try
+    End Try
+End Function
+
+Sub SMFSaveMountingFace(part As Inventor.PartDocument, face As Inventor.Face)
+    If part Is Nothing OrElse face Is Nothing Then Throw New System.Exception("the mounting face is missing")
+    Dim ctx As Integer = part.ReferenceKeyManager.CreateKeyContext()
+    Try
+        Dim key() As Byte = New Byte() {}
+        face.GetReferenceKey(key, ctx)
+        Dim ctxData() As Byte = New Byte() {}
+        part.ReferenceKeyManager.SaveContextToArray(ctx, ctxData)
+        SMFWriteCustomProperty(part, "MGH Mounting Face", part.ReferenceKeyManager.KeyToString(key))
+        SMFWriteCustomProperty(part, "MGH Mounting Face Context", System.Convert.ToBase64String(ctxData))
+    Finally
+        Try
+            part.ReferenceKeyManager.ReleaseKeyContext(ctx)
+        Catch
+        End Try
+    End Try
+End Sub
+
+Sub SMFCloseDocument(doc As Inventor.Document)
+    If doc Is Nothing Then Exit Sub
+    Try
+        doc.Close(True)
+    Catch
+    End Try
+End Sub
+
+Sub SMFProgressMessage(bar As Inventor.ProgressBar, app As Inventor.Application, message As String)
+    If bar IsNot Nothing Then bar.Message = message
+    Try
+        app.StatusBarText = message
+        app.UserInterfaceManager.DoEvents()
+    Catch
+    End Try
+End Sub
+
+Sub SMFProgressTick(bar As Inventor.ProgressBar, app As Inventor.Application, message As String)
+    If bar IsNot Nothing Then
+        bar.Message = message
+        Try
+            bar.UpdateProgress()
+        Catch
+        End Try
+    End If
+    Try
+        app.StatusBarText = message
+        app.UserInterfaceManager.DoEvents()
+    Catch
+    End Try
+End Sub
