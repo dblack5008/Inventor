@@ -1815,6 +1815,25 @@ Public Class MGHWasherModel
     Public FilePath As String
 End Class
 
+' One component-hole walk is reused for the washer, the nut, and the screw.
+Public Class MGHSeatCacheEntry
+    Public Ok As Boolean
+    Public Contact As Inventor.Point
+    Public Outward As Inventor.UnitVector
+    Public HoleEdge As Inventor.Edge
+End Class
+
+' Hardware already in the assembly, read once before placement starts.
+Public Class MGHKnownHardware
+    Public Occurrence As Inventor.ComponentOccurrence
+    Public Role As String
+    Public Side As String
+    Public HasSide As Boolean
+    Public Center As Inventor.Point
+    Public FromAttribute As Boolean
+    Public Name As String
+End Class
+
 ' Assembly attribute sets reject CopyWithOwner on some files. Try both flags.
 Function MGHEnsureAttributeSet(sets As Inventor.AttributeSets, name As String) As Inventor.AttributeSet
     If sets.NameIsUsed(name) Then Return sets.Item(name)
@@ -2658,6 +2677,7 @@ Function MGHMatrixMoved(app As Inventor.Application, before As Inventor.Matrix, 
     Return False
 End Function
 
+' Kept for the placement math. Hardware is grounded at the matrix instead of insert-constrained.
 Function MGHWasherSitsOutside(occ As Inventor.ComponentOccurrence, model As MGHWasherModel, _
     contact As Inventor.Point, outward As Inventor.UnitVector, app As Inventor.Application) As Boolean
     Dim mid As Inventor.Point = app.TransientGeometry.CreatePoint(model.MidX, model.MidY, model.MidZ)
@@ -2812,149 +2832,107 @@ Function MGHHardwareNameMatchesRole(name As String, roleName As String) As Boole
     Return name.StartsWith("MGH Washer ", System.StringComparison.OrdinalIgnoreCase)
 End Function
 
-Function MGHRemoveWashersAt(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    centers As System.Collections.Generic.List(Of Inventor.Point), keep As Inventor.ComponentOccurrence, _
-    endName As String, roleName As String) As Integer
-    Dim doomed As New System.Collections.Generic.List(Of Inventor.ComponentOccurrence)()
+' Read every existing fastener once. Placement then matches against this list.
+Function MGHListExistingHardware(app As Inventor.Application, asm As Inventor.AssemblyDocument) As System.Collections.Generic.List(Of MGHKnownHardware)
+    Dim found As New System.Collections.Generic.List(Of MGHKnownHardware)()
+    If asm Is Nothing Then Return found
     For Each occ As Inventor.ComponentOccurrence In asm.ComponentDefinition.Occurrences
         Try
-            If keep IsNot Nothing AndAlso occ Is keep Then Continue For
-            Dim stored As Inventor.Point = Nothing
-            Dim sawOtherRole As Boolean = False
-            Dim haveSide As Boolean = False
-            Dim sideOk As Boolean = True
-            Dim occName As String = ""
-            Try
-                occName = occ.Name
-            Catch
-                occName = ""
-            End Try
-            Try
-                If occ.AttributeSets.NameIsUsed("MGH_Hardware") Then
-                    Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
-                    If Not String.Equals(MGHGetAttr(aset, "Role"), roleName, System.StringComparison.Ordinal) Then
-                        sawOtherRole = True
-                    Else
-                        stored = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
-                        Dim side As String = MGHGetAttr(aset, "Side")
-                        If side <> "" Then
-                            haveSide = True
-                            sideOk = String.Equals(side, endName, System.StringComparison.OrdinalIgnoreCase)
-                        End If
-                    End If
-                End If
-            Catch
-            End Try
-            If sawOtherRole Then Continue For
-            If haveSide AndAlso Not sideOk Then Continue For
-            If stored Is Nothing Then
-                If Not MGHHardwareNameMatchesRole(occName, roleName) Then Continue For
-                If Not MGHWasherNameMatchesEnd(occName, endName) Then Continue For
-                stored = MGHParseStoredPoint(app, MGHCenterTextFromWasherName(occName))
-            End If
-            If stored Is Nothing Then Continue For
-            For Each center As Inventor.Point In centers
-                If stored.DistanceTo(center) < 0.005 Then
-                    doomed.Add(occ)
-                    Exit For
-                End If
-            Next
+            Dim item As MGHKnownHardware = MGHReadKnownHardware(app, occ)
+            If item IsNot Nothing Then found.Add(item)
         Catch
         End Try
     Next
-    Dim removed As Integer = 0
-    For Each occ As Inventor.ComponentOccurrence In doomed
-        occ.Delete()
-        removed += 1
-    Next
-    Return removed
+    Return found
 End Function
 
-' Empty result means the insert constraint seated the washer. Otherwise the washer is grounded in place.
-' hostOcc is the component that owns the hole. An edge that is already an assembly proxy is used as-is.
-Function MGHConstrainWasher(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
-    hostOcc As Inventor.ComponentOccurrence, washerOcc As Inventor.ComponentOccurrence, _
-    holeEdge As Inventor.Edge, model As MGHWasherModel, contact As Inventor.Point, _
-    outward As Inventor.UnitVector) As String
-    Dim washerSaved As Inventor.Matrix = washerOcc.Transformation.Copy()
-    Dim hostSaved As Inventor.Matrix = Nothing
-    Dim hostWasGrounded As Boolean = True
-    Dim heldHost As Boolean = False
-    If hostOcc IsNot Nothing Then
-        hostSaved = hostOcc.Transformation.Copy()
-        hostWasGrounded = hostOcc.Grounded
-        If Not hostWasGrounded Then
-            Try
-                hostOcc.Grounded = True
-                heldHost = True
-            Catch
-                heldHost = False
-            End Try
+Function MGHReadKnownHardware(app As Inventor.Application, occ As Inventor.ComponentOccurrence) As MGHKnownHardware
+    If occ Is Nothing Then Return Nothing
+    Dim occName As String = ""
+    Try
+        occName = occ.Name
+    Catch
+        occName = ""
+    End Try
+    Dim role As String = ""
+    Dim side As String = ""
+    Dim hasSide As Boolean = False
+    Dim stored As Inventor.Point = Nothing
+    Dim fromAttribute As Boolean = False
+    Try
+        If occ.AttributeSets.NameIsUsed("MGH_Hardware") Then
+            fromAttribute = True
+            Dim aset As Inventor.AttributeSet = occ.AttributeSets.Item("MGH_Hardware")
+            role = MGHGetAttr(aset, "Role")
+            stored = MGHParseStoredPoint(app, MGHGetAttr(aset, "Center"))
+            side = MGHGetAttr(aset, "Side")
+            hasSide = side <> ""
         End If
+    Catch
+        fromAttribute = False
+        stored = Nothing
+    End Try
+    If Not fromAttribute Then
+        If MGHHardwareNameMatchesRole(occName, "Nut") Then
+            role = "Nut"
+        ElseIf MGHHardwareNameMatchesRole(occName, "Screw") Then
+            role = "Screw"
+        ElseIf MGHHardwareNameMatchesRole(occName, "Washer") Then
+            role = "Washer"
+        Else
+            Return Nothing
+        End If
+        stored = MGHParseStoredPoint(app, MGHCenterTextFromWasherName(occName))
     End If
-    Dim inserted As Inventor.InsertConstraint = Nothing
-    Dim attempt As Integer
-    For attempt = 0 To 1
-        Dim opposed As Boolean = (attempt = 1)
-        If inserted IsNot Nothing Then
-            Try
-                inserted.Delete()
-            Catch
-            End Try
-            inserted = Nothing
-            Try
-                washerOcc.Transformation = washerSaved.Copy()
-            Catch
-            End Try
-        End If
-        Try
-            Dim holeProxy As Object = holeEdge
-            If TryCast(holeEdge, Inventor.EdgeProxy) Is Nothing Then
-                If hostOcc Is Nothing Then Throw New System.Exception("the component occurrence is missing")
-                hostOcc.CreateGeometryProxy(holeEdge, holeProxy)
+    If stored Is Nothing Then Return Nothing
+    Dim item As New MGHKnownHardware()
+    item.Occurrence = occ
+    item.Role = role
+    item.Side = side
+    item.HasSide = hasSide
+    item.Center = stored
+    item.FromAttribute = fromAttribute
+    item.Name = occName
+    Return item
+End Function
+
+Function MGHRemoveWashersAt(known As System.Collections.Generic.List(Of MGHKnownHardware), _
+    centers As System.Collections.Generic.List(Of Inventor.Point), keep As Inventor.ComponentOccurrence, _
+    endName As String, roleName As String) As Integer
+    If known Is Nothing OrElse centers Is Nothing Then Return 0
+    Dim removed As Integer = 0
+    Dim index As Integer = known.Count - 1
+    Do While index >= 0
+        Dim item As MGHKnownHardware = known(index)
+        Dim drop As Boolean = False
+        If item IsNot Nothing AndAlso item.Occurrence IsNot Nothing AndAlso item.Center IsNot Nothing Then
+            If keep Is Nothing OrElse Not (item.Occurrence Is keep) Then
+                Dim roleOk As Boolean = False
+                Dim sideOk As Boolean = True
+                If item.FromAttribute Then
+                    roleOk = String.Equals(item.Role, roleName, System.StringComparison.Ordinal)
+                    If item.HasSide Then sideOk = String.Equals(item.Side, endName, System.StringComparison.OrdinalIgnoreCase)
+                Else
+                    roleOk = MGHHardwareNameMatchesRole(item.Name, roleName) AndAlso MGHWasherNameMatchesEnd(item.Name, endName)
+                End If
+                If roleOk AndAlso sideOk Then
+                    For Each center As Inventor.Point In centers
+                        If item.Center.DistanceTo(center) < 0.005 Then
+                            drop = True
+                            Exit For
+                        End If
+                    Next
+                End If
             End If
-            Dim washerProxy As Object = Nothing
-            washerOcc.CreateGeometryProxy(model.BearingEdge, washerProxy)
-            inserted = asm.ComponentDefinition.Constraints.AddInsertConstraint(washerProxy, holeProxy, opposed, 0)
-            asm.Update2(True)
-        Catch
-            inserted = Nothing
-        End Try
-        If inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app) Then Exit For
-    Next
-    If heldHost Then
-        Try
-            hostOcc.Grounded = False
-        Catch
-        End Try
-    End If
-    Dim hostMoved As Boolean = hostOcc IsNot Nothing AndAlso hostSaved IsNot Nothing AndAlso MGHMatrixMoved(app, hostSaved, hostOcc.Transformation)
-    Dim seated As Boolean = inserted IsNot Nothing AndAlso MGHWasherSitsOutside(washerOcc, model, contact, outward, app)
-    If hostMoved OrElse Not seated Then
-        If inserted IsNot Nothing Then
-            Try
-                inserted.Delete()
-            Catch
-            End Try
         End If
-        If hostOcc IsNot Nothing AndAlso hostSaved IsNot Nothing Then
-            Try
-                hostOcc.Transformation = hostSaved
-            Catch
-            End Try
+        If drop Then
+            item.Occurrence.Delete()
+            known.RemoveAt(index)
+            removed += 1
         End If
-        Try
-            washerOcc.Transformation = washerSaved
-        Catch
-        End Try
-        Try
-            washerOcc.Grounded = True
-        Catch
-        End Try
-        If hostMoved Then Return "grounded so the component would not move"
-        Return "positioned and grounded because the insert constraint did not seat it"
-    End If
-    Return ""
+        index -= 1
+    Loop
+    Return removed
 End Function
 
 Function MGHNativeSelectedEdge(rim As MGHComponentRim) As Inventor.Edge
@@ -3196,11 +3174,39 @@ End Function
 ' in assembly space, so the other end is that point plus the part-space hole depth.
 ' holeEdge is an assembly proxy when one can be made.
 ' Returns False when the opposite end of this component hole cannot be found.
+Function MGHSeatCacheKey(x As Double, y As Double, z As Double, onSelectedRim As Boolean) As String
+    Dim culture As System.Globalization.CultureInfo = System.Globalization.CultureInfo.InvariantCulture
+    Return x.ToString("0.000000", culture) & "," & y.ToString("0.000000", culture) & "," & z.ToString("0.000000", culture) & If(onSelectedRim, "|S", "|O")
+End Function
+
+Sub MGHRememberSeat(cache As System.Collections.Generic.Dictionary(Of String, MGHSeatCacheEntry), cacheKey As String, _
+    ok As Boolean, contact As Inventor.Point, outward As Inventor.UnitVector, holeEdge As Inventor.Edge)
+    If cache Is Nothing OrElse cacheKey = "" OrElse cache.ContainsKey(cacheKey) Then Return
+    Dim entry As New MGHSeatCacheEntry()
+    entry.Ok = ok
+    entry.Contact = contact
+    entry.Outward = outward
+    entry.HoleEdge = holeEdge
+    cache.Add(cacheKey, entry)
+End Sub
+
 Function MGHComponentWasherSeat(app As Inventor.Application, rim As MGHComponentRim, onSelectedRim As Boolean, _
-    ByRef contact As Inventor.Point, ByRef outward As Inventor.UnitVector, ByRef holeEdge As Inventor.Edge) As Boolean
+    ByRef contact As Inventor.Point, ByRef outward As Inventor.UnitVector, ByRef holeEdge As Inventor.Edge, _
+    Optional cache As System.Collections.Generic.Dictionary(Of String, MGHSeatCacheEntry) = Nothing) As Boolean
     contact = Nothing
     outward = Nothing
     holeEdge = Nothing
+    Dim cacheKey As String = ""
+    If cache IsNot Nothing AndAlso rim IsNot Nothing Then
+        cacheKey = MGHSeatCacheKey(rim.CenterX, rim.CenterY, rim.CenterZ, onSelectedRim)
+        If cache.ContainsKey(cacheKey) Then
+            Dim hit As MGHSeatCacheEntry = cache(cacheKey)
+            contact = hit.Contact
+            outward = hit.Outward
+            holeEdge = hit.HoleEdge
+            Return hit.Ok
+        End If
+    End If
     If rim Is Nothing OrElse rim.Component Is Nothing OrElse rim.SelectedEdge Is Nothing Then
         Throw New System.Exception("the selected component hole is missing")
     End If
@@ -3259,13 +3265,17 @@ Function MGHComponentWasherSeat(app As Inventor.Application, rim As MGHComponent
             dirX = outSign * axisX : dirY = outSign * axisY : dirZ = outSign * axisZ
         End If
     Else
-        If farAsm Is Nothing Then Return False
+        If farAsm Is Nothing Then
+            MGHRememberSeat(cache, cacheKey, False, Nothing, Nothing, Nothing)
+            Return False
+        End If
         contact = farAsm
         holeEdge = farEdge
         MGHOutwardFromEnds(selectedAsm.X, selectedAsm.Y, selectedAsm.Z, farAsm.X, farAsm.Y, farAsm.Z, False, dirX, dirY, dirZ)
     End If
     If dirX * dirX + dirY * dirY + dirZ * dirZ < 0.000000001 Then Throw New System.Exception("the component hole has no outward direction")
     outward = tg.CreateUnitVector(dirX, dirY, dirZ)
+    MGHRememberSeat(cache, cacheKey, True, contact, outward, holeEdge)
     Return True
 End Function
 
@@ -3296,10 +3306,10 @@ End Function
 
 Function MGHPlaceHardwareItem(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
     model As MGHWasherModel, contact As Inventor.Point, outward As Inventor.UnitVector, _
-    holeEdge As Inventor.Edge, host As Inventor.ComponentOccurrence, _
     roleName As String, sizeName As String, center As Inventor.Point, _
     endName As String, station As String, sourceFile As String, roleLabel As String, _
-    constrainToHole As Boolean, notes As System.Collections.Generic.List(Of String), _
+    known As System.Collections.Generic.List(Of MGHKnownHardware), _
+    notes As System.Collections.Generic.List(Of String), _
     ByRef replaced As Integer) As Integer
     Dim hardwareOcc As Inventor.ComponentOccurrence = Nothing
     Dim kept As Boolean = False
@@ -3310,26 +3320,13 @@ Function MGHPlaceHardwareItem(app As Inventor.Application, asm As Inventor.Assem
         action = "adding the " & roleLabel & " to the assembly"
         hardwareOcc = MGHAddWasherOccurrence(asm, model, matrix)
         kept = True
-        ' Leave the occurrence name Inventor assigned from the part file.
-        Dim centerText As String = MGHFormatPoint(center)
-        Dim warning As String = ""
+        ' The matrix already puts the bearing face on the contact point. An insert
+        ' constraint solves the whole assembly, which took about ten seconds per nut.
         Try
-            If constrainToHole AndAlso holeEdge IsNot Nothing AndAlso model.BearingEdge IsNot Nothing Then
-                warning = MGHConstrainWasher(app, asm, host, hardwareOcc, holeEdge, model, contact, outward)
-            Else
-                Try
-                    hardwareOcc.Grounded = True
-                Catch
-                End Try
-                If constrainToHole Then warning = "positioned and grounded because a circular rim was not found"
-            End If
-        Catch constrainEx As System.Exception
-            notes.Add(sizeName & " " & roleLabel & " at " & centerText & " is placed, but constraining it failed: " & constrainEx.Message)
-            Try
-                hardwareOcc.Grounded = True
-            Catch
-            End Try
+            hardwareOcc.Grounded = True
+        Catch
         End Try
+        Dim centerText As String = MGHFormatPoint(center)
         Try
             Dim aset As Inventor.AttributeSet = MGHEnsureAttributeSet(hardwareOcc.AttributeSets, "MGH_Hardware")
             MGHPutAttr(aset, "Role", roleName)
@@ -3344,11 +3341,10 @@ Function MGHPlaceHardwareItem(app As Inventor.Application, asm As Inventor.Assem
         Dim oneCenter As New System.Collections.Generic.List(Of Inventor.Point)()
         oneCenter.Add(center)
         Try
-            replaced += MGHRemoveWashersAt(app, asm, oneCenter, hardwareOcc, endName, roleName)
+            replaced += MGHRemoveWashersAt(known, oneCenter, hardwareOcc, endName, roleName)
         Catch
             notes.Add("The previous " & roleLabel & " at " & centerText & " could not be removed.")
         End Try
-        If warning <> "" Then notes.Add(sizeName & " " & roleLabel & " " & hardwareOcc.Name & " was " & warning & ".")
         Return 1
     Catch ex As System.Exception
         If hardwareOcc IsNot Nothing AndAlso Not kept Then
@@ -3770,6 +3766,8 @@ Function MGHPartToAssembly(occ As Inventor.ComponentOccurrence, _
 End Function
 
 ' Native circular edge of the plate hole nearest this plate-space center.
+' Placement does not call this. Walking every edge of a heavy plate once per nut
+' was one of the costs that made each fastener take several seconds.
 Function MGHPlateRimEdge(plateOcc As Inventor.ComponentOccurrence, center As Inventor.Point) As Inventor.Edge
     If plateOcc Is Nothing OrElse center Is Nothing Then Return Nothing
     Dim def As Inventor.PartComponentDefinition = TryCast(plateOcc.Definition, Inventor.PartComponentDefinition)
@@ -3810,11 +3808,9 @@ Function MGHPlateHardwareSeat(app As Inventor.Application, plateOcc As Inventor.
     contact = center.Copy()
     contact.TransformBy(plateMatrix)
     outward = app.TransientGeometry.CreateUnitVector(outX / length, outY / length, outZ / length)
-    Try
-        holeEdge = MGHPlateRimEdge(plateOcc, center)
-    Catch
-        holeEdge = Nothing
-    End Try
+    ' The plate contact is this face point. Searching every edge for a rim was only
+    ' used by the insert constraint, and that search walked the whole heavy part once per nut.
+    holeEdge = Nothing
     Return True
 End Function
 
@@ -3894,6 +3890,8 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     ' iLogic already has a transaction open on the assembly. Starting a second one
     ' raises E_FAIL, so these edits are not wrapped in another assembly transaction.
     Dim stepName As String = "Preparing washer placement"
+    Dim deferArmed As Boolean = False
+    Dim previousDefer As Boolean = False
     Try
     Dim sizes As New System.Collections.Generic.List(Of String)()
     For Each g As OutputGroup In groups.Values
@@ -4133,6 +4131,9 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
     End Try
     Dim placeIndex As Integer = 0
     Dim tg As Inventor.TransientGeometry = app.TransientGeometry
+    Dim seatCache As New System.Collections.Generic.Dictionary(Of String, MGHSeatCacheEntry)(System.StringComparer.Ordinal)
+    Dim knownHardware As System.Collections.Generic.List(Of MGHKnownHardware) = MGHListExistingHardware(app, asm)
+    MGHBeginDeferredAssembly(app, previousDefer, deferArmed)
         For Each g As OutputGroup In groups.Values
             If g.Screw Is Nothing Then Continue For
             Dim sizeName As String = g.Screw.Trim()
@@ -4181,26 +4182,23 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     Dim contact As Inventor.Point = Nothing
                     Dim outwardAsm As Inventor.UnitVector = Nothing
                     Dim holeEdge As Inventor.Edge = Nothing
-                    Dim host As Inventor.ComponentOccurrence = Nothing
                     Dim seated As Boolean = False
                     If onSelectedRim Then
                         If rim Is Nothing Then
                             notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
                             Continue For
                         End If
-                        host = rim.Component
-                        seated = MGHComponentWasherSeat(app, rim, True, contact, outwardAsm, holeEdge)
+                        seated = MGHComponentWasherSeat(app, rim, True, contact, outwardAsm, holeEdge, seatCache)
                     Else
-                        host = plateOcc
                         seated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, contact, outwardAsm, holeEdge)
                     End If
                     If Not seated Then
                         notes.Add(sizeName & " " & roleLabel & " at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
                         Continue For
                     End If
-                    Dim added As Integer = MGHPlaceHardwareItem(app, asm, washerModel, contact, outwardAsm, holeEdge, host, _
+                    Dim added As Integer = MGHPlaceHardwareItem(app, asm, washerModel, contact, outwardAsm, _
                         "Washer", sizeName, center, endName, If(underNut, "UnderNut", "UnderScrew"), _
-                        chosenWashers(sizeName), roleLabel, True, notes, replaced)
+                        chosenWashers(sizeName), roleLabel, knownHardware, notes, replaced)
                     washersPlaced += added
                     If underNut AndAlso added = 1 Then
                         nutWasherPlaced = True
@@ -4219,18 +4217,15 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     Dim nutContact As Inventor.Point = Nothing
                     Dim nutOutward As Inventor.UnitVector = Nothing
                     Dim nutEdge As Inventor.Edge = Nothing
-                    Dim nutHost As Inventor.ComponentOccurrence = Nothing
                     Dim nutSeated As Boolean = False
                     If nutOnRim Then
                         If rim Is Nothing Then
                             notes.Add(sizeName & " nut at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
                             nutSeated = False
                         Else
-                            nutHost = rim.Component
-                            nutSeated = MGHComponentWasherSeat(app, rim, True, nutContact, nutOutward, nutEdge)
+                            nutSeated = MGHComponentWasherSeat(app, rim, True, nutContact, nutOutward, nutEdge, seatCache)
                         End If
                     Else
-                        nutHost = plateOcc
                         nutSeated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, nutContact, nutOutward, nutEdge)
                     End If
                     If Not nutSeated Then
@@ -4245,8 +4240,8 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                                 nutWasherThickness, stackedX, stackedY, stackedZ)
                             nutContact = tg.CreatePoint(stackedX, stackedY, stackedZ)
                         End If
-                        nutsPlaced += MGHPlaceHardwareItem(app, asm, nutModel, nutContact, nutOutward, nutEdge, nutHost, _
-                            "Nut", sizeName, center, nutEnd, "Nut", chosenNuts(sizeName), "nut", Not stackOnWasher, notes, replaced)
+                        nutsPlaced += MGHPlaceHardwareItem(app, asm, nutModel, nutContact, nutOutward, _
+                            "Nut", sizeName, center, nutEnd, "Nut", chosenNuts(sizeName), "nut", knownHardware, notes, replaced)
                     End If
                 End If
                 Dim screwKey As String = MGHScrewLengthKey(sizeName, MGHScrewRequiredInches(MGHHoleGripCm(app, plateOcc, plateToAssembly, center, rim), groupScrewWasher, groupNutWasher, groupNutIn))
@@ -4260,17 +4255,14 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                     Dim screwContact As Inventor.Point = Nothing
                     Dim screwOutward As Inventor.UnitVector = Nothing
                     Dim screwEdge As Inventor.Edge = Nothing
-                    Dim screwHost As Inventor.ComponentOccurrence = Nothing
                     Dim screwSeated As Boolean = False
                     If screwOnRim Then
                         If rim Is Nothing Then
                             notes.Add(sizeName & " screw at " & MGHFormatPoint(center) & " was skipped because the component hole rim was not recorded.")
                         Else
-                            screwHost = rim.Component
-                            screwSeated = MGHComponentWasherSeat(app, rim, True, screwContact, screwOutward, screwEdge)
+                            screwSeated = MGHComponentWasherSeat(app, rim, True, screwContact, screwOutward, screwEdge, seatCache)
                         End If
                     Else
-                        screwHost = plateOcc
                         screwSeated = MGHPlateHardwareSeat(app, plateOcc, plateToAssembly, plateOutX, plateOutY, plateOutZ, center, screwContact, screwOutward, screwEdge)
                     End If
                     If screwSeated Then
@@ -4281,14 +4273,16 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
                                 screwWasherThickness, stackedX, stackedY, stackedZ)
                             screwContact = tg.CreatePoint(stackedX, stackedY, stackedZ)
                         End If
-                        screwsPlaced += MGHPlaceHardwareItem(app, asm, screwModel, screwContact, screwOutward, screwEdge, screwHost, _
-                            "Screw", sizeName, center, screwEnd, "Screw", chosenScrews(screwKey), "screw", Not stackOnWasher, notes, replaced)
+                        screwsPlaced += MGHPlaceHardwareItem(app, asm, screwModel, screwContact, screwOutward, _
+                            "Screw", sizeName, center, screwEnd, "Screw", chosenScrews(screwKey), "screw", knownHardware, notes, replaced)
                     ElseIf rim IsNot Nothing OrElse Not screwOnRim Then
                         notes.Add(sizeName & " screw at " & MGHFormatPoint(center) & " was skipped because its seat face was not found.")
                     End If
                 End If
             Next
         Next
+    If deferArmed Then MGHProgressMessage(hardwareProgress, app, "Updating the assembly once")
+    MGHEndDeferredAssembly(app, asm, deferArmed, previousDefer)
     app.StatusBarText = ""
 
     Dim summary As New System.Text.StringBuilder()
@@ -4317,9 +4311,40 @@ Function MGHPlaceWashers(app As Inventor.Application, asm As Inventor.AssemblyDo
             Catch
             End Try
         End If
+        MGHEndDeferredAssembly(app, asm, deferArmed, previousDefer)
         Return "Hardware was not placed during " & stepName & "." & vbCrLf & ex.Message
     End Try
 End Function
+
+' AssemblyOptions.DeferUpdate is the application option that pauses assembly solves.
+' Part and sheet-metal definitions do not have DeferUpdates. Always restore the previous value.
+Sub MGHBeginDeferredAssembly(app As Inventor.Application, ByRef previousDefer As Boolean, ByRef armed As Boolean)
+    armed = False
+    previousDefer = False
+    If app Is Nothing Then Return
+    Try
+        previousDefer = app.AssemblyOptions.DeferUpdate
+        If previousDefer Then Return
+        app.AssemblyOptions.DeferUpdate = True
+        armed = True
+    Catch
+        armed = False
+    End Try
+End Sub
+
+Sub MGHEndDeferredAssembly(app As Inventor.Application, asm As Inventor.AssemblyDocument, _
+    ByRef armed As Boolean, previousDefer As Boolean)
+    If Not armed Then Return
+    armed = False
+    Try
+        If app IsNot Nothing Then app.AssemblyOptions.DeferUpdate = previousDefer
+    Catch
+    End Try
+    Try
+        If asm IsNot Nothing AndAlso asm.RequiresUpdate Then asm.Update2(True)
+    Catch
+    End Try
+End Sub
 
 
 Function MGHDefaultThread(size As String) As String

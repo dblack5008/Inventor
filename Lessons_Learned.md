@@ -176,7 +176,7 @@ Inventor internal length is centimeters. Show inches as the centimeter value div
 
 **Why.** Inventor 2027 does not declare `DeferUpdates` on `PartComponentDefinition`, `SheetMetalComponentDefinition`, or `AssemblyComponentDefinition`. iLogic late-binds that assignment against the runtime type, so a sheet-metal plate and a standard part both fail. `DeferUpdates` does exist on sketches. `DeferUpdate` (singular) on assembly options, flat-pattern settings, and general preferences is a different switch.
 
-**Next time.** Defer the sketch solve only. Create the hole features, then call `Document.Update2` once. Do not assign `DeferUpdates` on a component definition, and do not toggle the assembly, flat-pattern, or preference switches to pause a part rebuild.
+**Next time.** Defer the sketch solve only. Create the hole features, then call `Document.Update2` once. Do not assign `DeferUpdates` on a component definition. `AssemblyOptions.DeferUpdate` pauses assembly solves only. Save the previous value, use it around a batch of assembly edits, restore it, and update the assembly once. Do not leave it changed, and do not use it to pause a part rebuild.
 
 **Error.** Four holes on a sheet-metal part that already had many sketches and features took about ten minutes, after countersinks were no longer linked to `Clearance.xls`.
 
@@ -191,3 +191,11 @@ Inventor internal length is centimeters. Show inches as the centimeter value div
 **Why.** `AttributeSet.Item(name)` throws when that name is absent. `AttributeSets.NameIsUsed` only tells you the set exists. Older hole features store one attribute named `GroupKey`. This rule stores each identity field on its own and removes `GroupKey`. Reading `GroupKey` on every `MGH_Generator` set hits a feature that does not have it.
 
 **Next time.** Read an attribute only after `NameIsUsed` on that attribute. Confirm a countersink on the features this run created or reused. A missing legacy key is old metadata. It is not a failed hole, and it must not roll the transaction back.
+
+## Placing hardware
+
+**Error.** Each nut took about ten seconds. A run that placed washers, nuts, and screws on several holes felt stuck on every fastener.
+
+**Why.** Two costs ran once per fastener. `AddInsertConstraint` followed by `AssemblyDocument.Update2` solved the whole assembly, including the heavy sheet-metal plate. The plate-side seat also read every edge of that plate looking for the hole rim, even when the rim was only needed for the constraint. Replacing an older fastener scanned every assembly occurrence again. Adding the occurrence itself rebuilt the assembly when assembly updates were live.
+
+**Next time.** Position the fastener with the matrix and ground it. The bearing face is already on the contact point and the axis already follows the outward direction. Skip the insert constraint, so a failed solve cannot drag the plate. Save `AssemblyOptions.DeferUpdate`, turn it on while the fasteners are added, restore the previous value, and update the assembly once. Read existing hardware occurrences once. Walk a component hole once and reuse that seat for the washer, the nut, and the screw. The plate contact is the selected face point plus the outward normal. Do not scan the plate body to find a rim for a constraint that is not created.
