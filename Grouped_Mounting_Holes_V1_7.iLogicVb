@@ -418,7 +418,6 @@ Sub Main()
                         Throw New System.Exception("Existing group diameter differs: " & feat.Name & ". Check the feature and specifications.")
                     End If
                 End If
-                If g.Seat = "Countersink" Then MGHEnforceCountersink(feat, g, True)
                 MGHCheckExistingSeat(feat, g)
                 Dim pd As Inventor.SketchHolePlacementDefinition = TryCast(feat.PlacementDefinition, Inventor.SketchHolePlacementDefinition)
                 If pd Is Nothing Then Throw New System.Exception("Existing matching feature is no longer sketch-based: " & feat.Name)
@@ -494,8 +493,8 @@ Sub Main()
             newPoints += MGHAddHoleCenters(sk, g.Centers, pts)
             operationInfo = "Creating hole feature: " & g.Label
             Dim place As Inventor.SketchHolePlacementDefinition = holes.CreateSketchPlacementDefinition(pts)
-            ' Countersink values are asserted after the shared rebuild, when ModelValue is current.
-            Dim h As Inventor.HoleFeature = MGHCreateGroupedFeature(holes, place, g, inwardDirections(g.Key), False)
+            ' Countersink values are checked after the shared rebuild, when ModelValue is current.
+            Dim h As Inventor.HoleFeature = MGHCreateGroupedFeature(holes, place, g, inwardDirections(g.Key))
             If h Is Nothing Then Throw New System.Exception("Inventor returned no Hole feature for " & g.Label)
             createdFeatures.Add(g.Key, h)
             ' Feature metadata is authoritative for adding holes on subsequent runs;
@@ -637,19 +636,32 @@ Sub Main()
             Next
         End If
 
-        ' Recompute can cause native clearance tables to restore countersink
-        ' dimensions. Reject the group if the saved model differs from user input.
+        ' A seated hole keeps the diameters from the review. An older hole on this
+        ' plate can carry MGH_Generator without a GroupKey attribute. Reading that
+        ' name throws E_INVALIDARG and would roll back every hole just created.
+        ' Check the features from this run directly.
         operationInfo = "Confirming countersink diameters and included angles after recompute"
         MGHProgressMessage(progress, app, operationInfo)
-        For Each checkFeat As Inventor.HoleFeature In holes
-            If checkFeat.AttributeSets.NameIsUsed("MGH_Generator") Then
-                Dim checkSet As Inventor.AttributeSet = checkFeat.AttributeSets.Item("MGH_Generator")
-                Dim checkKey As String = CStr(checkSet.Item("GroupKey").Value)
-                If desiredGroups.ContainsKey(checkKey) Then
-                    Dim requested As OutputGroup = desiredGroups(checkKey)
-                    If requested.Seat="Countersink" Then MGHAssertCountersink(checkFeat,requested)
-                End If
+        Dim countersinkCorrected As Boolean = False
+        Dim checkFeat As Inventor.HoleFeature = Nothing
+        For Each requested As OutputGroup In desiredGroups.Values
+            checkFeat = MGHRunCountersink(createdFeatures, existing, requested)
+            If checkFeat Is Nothing Then Continue For
+            If MGHCountersinkMatches(checkFeat, requested) Then Continue For
+            MGHEnforceCountersink(checkFeat, requested, False)
+            countersinkCorrected = True
+        Next
+        If countersinkCorrected Then
+            operationInfo = "Rebuilding after correcting countersink diameters"
+            MGHProgressMessage(progress, app, operationInfo)
+            If Not plateDoc.Update2(False) Then
+                Throw New System.Exception("Part update failed after correcting countersink dimensions. " & _
+                    "The transaction will be aborted; inspect the model/feature geometry.")
             End If
+        End If
+        For Each requested As OutputGroup In desiredGroups.Values
+            checkFeat = MGHRunCountersink(createdFeatures, existing, requested)
+            If checkFeat IsNot Nothing Then MGHAssertCountersink(checkFeat, requested)
         Next
         MGHProgressTick(progress, app, "Final model recompute and countersink dimensions passed")
         operationInfo = "Committing the plate transaction"
@@ -1274,8 +1286,7 @@ Function MGHAddHoleCenters(sk As Inventor.PlanarSketch, _
 End Function
 
 Function MGHCreateGroupedFeature(holes As Inventor.HoleFeatures,place As Inventor.SketchHolePlacementDefinition, _
-    g As OutputGroup,direction As Inventor.PartFeatureExtentDirectionEnum, _
-    assertCountersinkNow As Boolean) As Inventor.HoleFeature
+    g As OutputGroup,direction As Inventor.PartFeatureExtentDirectionEnum) As Inventor.HoleFeature
     Dim diaInfo As Object=Nothing
     If g.Mode="Threaded" Then
         Try
@@ -1305,17 +1316,52 @@ Function MGHCreateGroupedFeature(holes As Inventor.HoleFeatures,place As Invento
             Throw New System.Exception("Unrecognized seat: " & g.Seat)
     End Select
     If h Is Nothing Then Throw New System.Exception("Inventor did not return a hole feature for " & g.Label)
-    If g.Mode="Clearance" Then MGHApplyClearanceInfo(holes,h,g)
-    If g.Seat="Countersink" Then MGHEnforceCountersink(h,g,assertCountersinkNow)
+    ' A plain drilled clearance hole uses Clearance.xls. A countersink, counterbore,
+    ' or spotface keeps the diameters passed to AddCSink, AddCBore, or AddSpotFace.
+    ' Linking those seats to the spreadsheet makes Inventor re-read it on every
+    ' edit, which takes minutes for a handful of holes, and the part cannot defer
+    ' that rebuild.
+    If MGHLinkClearanceTable(g.Mode, g.Seat) Then MGHApplyClearanceInfo(holes,h,g)
     Return h
+End Function
+
+' Plain clearance holes follow Clearance.xls. Seated holes keep the review diameters.
+Function MGHLinkClearanceTable(mode As String, seat As String) As Boolean
+    If mode Is Nothing OrElse seat Is Nothing Then Return False
+    Return String.Equals(mode, "Clearance", System.StringComparison.OrdinalIgnoreCase) AndAlso _
+           String.Equals(seat, "None", System.StringComparison.OrdinalIgnoreCase)
+End Function
+
+Function MGHRunCountersink(created As System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature), _
+    existing As System.Collections.Generic.Dictionary(Of String, Inventor.HoleFeature), _
+    g As OutputGroup) As Inventor.HoleFeature
+    If g Is Nothing OrElse Not String.Equals(g.Seat, "Countersink", System.StringComparison.OrdinalIgnoreCase) Then Return Nothing
+    If created IsNot Nothing AndAlso created.ContainsKey(g.Key) Then Return created(g.Key)
+    If existing IsNot Nothing AndAlso existing.ContainsKey(g.Key) Then Return existing(g.Key)
+    Return Nothing
+End Function
+
+Function MGHCountersinkMatches(h As Inventor.HoleFeature, g As OutputGroup) As Boolean
+    If h Is Nothing OrElse g Is Nothing Then Return False
+    Try
+        If h.HoleType <> Inventor.HoleTypeEnum.kCounterSinkHole Then Return False
+        If h.CSinkDiameter Is Nothing OrElse h.CSinkAngle Is Nothing Then Return False
+        Dim actualDia As Double = h.CSinkDiameter.ModelValue / 2.54
+        Dim actualDeg As Double = h.CSinkAngle.ModelValue * 180.0 / System.Math.PI
+        If System.Math.Abs(actualDia - g.SeatDiameterIn) > 0.00001 Then Return False
+        If System.Math.Abs(actualDeg - g.SeatAngleDeg) > 0.001 Then Return False
+        Return True
+    Catch
+        Return False
+    End Try
 End Function
 
 
 ' Inventor may replace user-entered seat dimensions when ClearanceInfo is applied.
 ' Make explicit dimensions authoritative. Inventor API works in cm and radians;
 ' using unit-qualified expressions avoids locale/document-unit ambiguity.
-' assertImmediately is False while the part solve is deferred: ModelValue can
-' still be stale, and the post-recompute MGHAssertCountersink call remains mandatory.
+' Pass False for assertImmediately when ModelValue may still be stale. The
+' check after Update2 is the one that accepts or rejects the countersink.
 Sub MGHEnforceCountersink(h As Inventor.HoleFeature,g As OutputGroup, assertImmediately As Boolean)
     If g.Seat<>"Countersink" Then Return
     If h.HoleType<>Inventor.HoleTypeEnum.kCounterSinkHole Then
