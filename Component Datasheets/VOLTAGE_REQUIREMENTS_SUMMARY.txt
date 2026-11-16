@@ -1,0 +1,77 @@
+
+VOLTAGE REQUIREMENTS SUMMARY FOR RF STAGE 1
+===========================================
+
+PURPOSE OF THIS DOCUMENT:
+This summary identifies all unique voltage supplies needed to power components in this system.
+
+DUAL-RAIL COMPONENTS:
+Some components require TWO voltage supplies (both positive and negative):
+  - TTL-1SP8T-183: Requires +5V AND -5V
+  - ZX76-31A-PNS+: Requires +3V AND -3.3V  
+  - ZX76-24G-30-S+: Requires +3.3V AND -3V
+
+WHY "RAIL 1" AND "RAIL 2"?
+These columns exist because some components need multiple voltage supplies.
+If a component only needs one voltage, only Rail 1 is populated.
+If it needs two voltages, both Rail 1 and Rail 2 are used.
+
+
+SWITCH MATRIX ENCLOSURE - REQUIRED VOLTAGES:
+============================================================
+
+    +5 V  |  Max Current:  1.6000 A
+
+    -5 V  |  Max Current:  0.2000 A
+
+============================================================
+
+ALL VOLTAGES IN COMPLETE COMPONENT CATALOG:
+============================================================
+
++3 V:
+  Components using this voltage:
+    - ZX76-31A-PNS+
+
++3.3 V:
+  Components using this voltage:
+    - ZX76-24G-30-S+
+
++5 V:
+  Components using this voltage:
+    - ZVA-443X+
+    - OD3010-05LB fan
+    - OD3010-05MB fan
+    - TTL-1SP8T-183
+    - OD3010-05HB fan
+    ... and 1 more
+
++12 V:
+  Components using this voltage:
+    - OD3010-12HB fan
+    - OD3010-12LB fan
+    - OD3010-12MB fan
+    - MSP2TA-18-12+ (de-energized)
+    - MSP2TA-18-12+ (energized)
+
++15 V:
+  Components using this voltage:
+    - ZFL-1000+
+
++28 V:
+  Components using this voltage:
+    - PA-124-D (all cells energized)
+
+-3 V:
+  Components using this voltage:
+    - ZX76-24G-30-S+
+
+-3.3 V:
+  Components using this voltage:
+    - ZX76-31A-PNS+
+
+-5 V:
+  Components using this voltage:
+    - TTL-1SP8T-183
+
+============================================================
